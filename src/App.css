@@ -92,6 +92,20 @@ body {
   overflow-wrap: break-word;
 }
 
+.message.pending {
+  opacity: 0.7;
+}
+
+.message.pending .message-text {
+  font-style: italic;
+}
+
+.message-actions {
+  display: flex;
+  gap: 4px;
+  flex-shrink: 0;
+}
+
 /* Markdown styling */
 .message-text p {
   margin: 0 0 8px 0;

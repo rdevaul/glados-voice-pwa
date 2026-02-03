@@ -10,18 +10,20 @@ interface Message {
   role: 'user' | 'assistant';
   text: string;
   audioUrl?: string;
+  audioBlobUrl?: string; // For user recordings (temporary, not persisted)
   timestamp: number;
+  pending?: boolean;
 }
 
 const STORAGE_KEY = 'glados-voice-history';
 const MAX_STORED_MESSAGES = 50;
 
-// Load messages from localStorage
 function loadMessages(): Message[] {
   try {
     const stored = localStorage.getItem(STORAGE_KEY);
     if (stored) {
-      return JSON.parse(stored);
+      // Filter out any pending messages that weren't completed
+      return JSON.parse(stored).filter((m: Message) => !m.pending);
     }
   } catch (e) {
     console.error('Failed to load messages:', e);
@@ -29,11 +31,13 @@ function loadMessages(): Message[] {
   return [];
 }
 
-// Save messages to localStorage
 function saveMessages(messages: Message[]) {
   try {
-    // Keep only recent messages to avoid storage bloat
-    const toStore = messages.slice(-MAX_STORED_MESSAGES);
+    // Don't save audioBlobUrls (they're temporary) or pending messages
+    const toStore = messages
+      .filter(m => !m.pending)
+      .slice(-MAX_STORED_MESSAGES)
+      .map(({ audioBlobUrl, ...rest }) => rest);
     localStorage.setItem(STORAGE_KEY, JSON.stringify(toStore));
   } catch (e) {
     console.error('Failed to save messages:', e);
@@ -49,10 +53,11 @@ function App() {
   const messagesEndRef = useRef<HTMLDivElement>(null);
   const audioRef = useRef<HTMLAudioElement | null>(null);
   const processedBlobRef = useRef<Blob | null>(null);
+  const abortControllerRef = useRef<AbortController | null>(null);
   
   const { isRecording, startRecording, stopRecording, audioBlob, error } = useVoiceRecorder();
 
-  // Save messages whenever they change
+  // Save messages whenever they change (but not pending ones)
   useEffect(() => {
     saveMessages(messages);
   }, [messages]);
@@ -74,7 +79,7 @@ function App() {
     messagesEndRef.current?.scrollIntoView({ behavior: 'smooth' });
   }, [messages]);
 
-  // Handle audio blob when recording completes - with dedup
+  // Handle audio blob when recording completes
   useEffect(() => {
     if (audioBlob && !isRecording && audioBlob !== processedBlobRef.current) {
       processedBlobRef.current = audioBlob;
@@ -82,17 +87,32 @@ function App() {
     }
   }, [audioBlob, isRecording]);
 
-  const addMessage = useCallback((role: 'user' | 'assistant', text: string, audioUrl?: string) => {
+  // Cleanup abort controller on unmount
+  useEffect(() => {
+    return () => {
+      abortControllerRef.current?.abort();
+    };
+  }, []);
+
+  const updateMessage = useCallback((id: string, updates: Partial<Message>) => {
+    setMessages(prev => prev.map(m => m.id === id ? { ...m, ...updates } : m));
+  }, []);
+
+  const addMessage = useCallback((role: 'user' | 'assistant', text: string, extras?: Partial<Message>): string => {
+    const id = `${Date.now()}-${Math.random()}`;
     setMessages(prev => [...prev, {
-      id: `${Date.now()}-${Math.random()}`,
+      id,
       role,
       text,
-      audioUrl,
       timestamp: Date.now(),
+      ...extras,
     }]);
+    return id;
   }, []);
 
   const playAudio = useCallback((url: string) => {
+    if (!url) return;
+    
     if (audioRef.current) {
       audioRef.current.pause();
       audioRef.current.src = url;
@@ -115,17 +135,53 @@ function App() {
     if (isProcessing) return;
     
     setIsProcessing(true);
-    addMessage('user', '🎤 [Voice message]');
+    
+    // Create a temporary URL for the user's recording
+    const userAudioUrl = URL.createObjectURL(blob);
+    
+    // Add user message with pending transcript
+    const userMsgId = addMessage('user', '🎤 Transcribing...', {
+      audioBlobUrl: userAudioUrl,
+      pending: true,
+    });
+    
+    // Cancel any existing request
+    abortControllerRef.current?.abort();
+    abortControllerRef.current = new AbortController();
     
     try {
       const response = await chatWithAudio(blob);
       const audioUrl = getAudioUrl(response.audio_url);
-      addMessage('assistant', response.text, audioUrl);
+      
+      // Update user message with transcript
+      const transcript = response.user_text || '🎤 [Voice message]';
+      updateMessage(userMsgId, { 
+        text: transcript, 
+        pending: false 
+      });
+      
+      // Add assistant response
+      addMessage('assistant', response.text, { audioUrl });
       playAudio(audioUrl);
     } catch (err) {
-      addMessage('assistant', `Error: ${err instanceof Error ? err.message : 'Unknown error'}`);
+      if (err instanceof Error && err.name === 'AbortError') {
+        // Request was cancelled, don't show error
+        return;
+      }
+      
+      const errorMsg = err instanceof Error ? err.message : 'Unknown error';
+      
+      // Update user message to show it was sent
+      updateMessage(userMsgId, { 
+        text: '🎤 [Voice message - transcript unavailable]', 
+        pending: false 
+      });
+      
+      // Add error message with retry option
+      addMessage('assistant', `Error: ${errorMsg}. Tap to retry or send another message.`);
     } finally {
       setIsProcessing(false);
+      abortControllerRef.current = null;
     }
   };
 
@@ -136,17 +192,29 @@ function App() {
     const text = textInput.trim();
     setTextInput('');
     setIsProcessing(true);
-    addMessage('user', text);
+    
+    const userMsgId = addMessage('user', text, { pending: true });
+    
+    abortControllerRef.current?.abort();
+    abortControllerRef.current = new AbortController();
 
     try {
       const response = await chatWithText(text);
       const audioUrl = getAudioUrl(response.audio_url);
-      addMessage('assistant', response.text, audioUrl);
+      
+      updateMessage(userMsgId, { pending: false });
+      addMessage('assistant', response.text, { audioUrl });
       playAudio(audioUrl);
     } catch (err) {
+      if (err instanceof Error && err.name === 'AbortError') {
+        return;
+      }
+      
+      updateMessage(userMsgId, { pending: false });
       addMessage('assistant', `Error: ${err instanceof Error ? err.message : 'Unknown error'}`);
     } finally {
       setIsProcessing(false);
+      abortControllerRef.current = null;
     }
   };
 
@@ -199,7 +267,7 @@ function App() {
           </div>
         )}
         {messages.map(msg => (
-          <div key={msg.id} className={`message ${msg.role}`}>
+          <div key={msg.id} className={`message ${msg.role} ${msg.pending ? 'pending' : ''}`}>
             <div className="message-text">
               {msg.role === 'assistant' ? (
                 <ReactMarkdown>{msg.text}</ReactMarkdown>
@@ -207,15 +275,30 @@ function App() {
                 msg.text
               )}
             </div>
-            {msg.audioUrl && (
-              <button 
-                className="play-button"
-                onClick={() => playAudio(msg.audioUrl!)}
-                aria-label="Play audio"
-              >
-                🔊
-              </button>
-            )}
+            <div className="message-actions">
+              {/* User voice message playback */}
+              {msg.audioBlobUrl && (
+                <button 
+                  className="play-button"
+                  onClick={() => playAudio(msg.audioBlobUrl!)}
+                  aria-label="Play your recording"
+                  title="Play your recording"
+                >
+                  🎤
+                </button>
+              )}
+              {/* Assistant audio playback */}
+              {msg.audioUrl && (
+                <button 
+                  className="play-button"
+                  onClick={() => playAudio(msg.audioUrl!)}
+                  aria-label="Play response"
+                  title="Play response"
+                >
+                  🔊
+                </button>
+              )}
+            </div>
           </div>
         ))}
         <div ref={messagesEndRef} />
