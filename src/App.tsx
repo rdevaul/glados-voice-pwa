@@ -1,4 +1,5 @@
 import { useState, useEffect, useRef, useCallback } from 'react';
+import ReactMarkdown from 'react-markdown';
 import { useVoiceRecorder } from './hooks/useVoiceRecorder';
 import { PushToTalkButton } from './components/PushToTalkButton';
 import { chatWithText, chatWithAudio, getAudioUrl } from './api/voiceApi';
@@ -9,10 +10,38 @@ interface Message {
   role: 'user' | 'assistant';
   text: string;
   audioUrl?: string;
+  timestamp: number;
+}
+
+const STORAGE_KEY = 'glados-voice-history';
+const MAX_STORED_MESSAGES = 50;
+
+// Load messages from localStorage
+function loadMessages(): Message[] {
+  try {
+    const stored = localStorage.getItem(STORAGE_KEY);
+    if (stored) {
+      return JSON.parse(stored);
+    }
+  } catch (e) {
+    console.error('Failed to load messages:', e);
+  }
+  return [];
+}
+
+// Save messages to localStorage
+function saveMessages(messages: Message[]) {
+  try {
+    // Keep only recent messages to avoid storage bloat
+    const toStore = messages.slice(-MAX_STORED_MESSAGES);
+    localStorage.setItem(STORAGE_KEY, JSON.stringify(toStore));
+  } catch (e) {
+    console.error('Failed to save messages:', e);
+  }
 }
 
 function App() {
-  const [messages, setMessages] = useState<Message[]>([]);
+  const [messages, setMessages] = useState<Message[]>(loadMessages);
   const [textInput, setTextInput] = useState('');
   const [isProcessing, setIsProcessing] = useState(false);
   const [micPermission, setMicPermission] = useState<'prompt' | 'granted' | 'denied'>('prompt');
@@ -23,6 +52,11 @@ function App() {
   
   const { isRecording, startRecording, stopRecording, audioBlob, error } = useVoiceRecorder();
 
+  // Save messages whenever they change
+  useEffect(() => {
+    saveMessages(messages);
+  }, [messages]);
+
   // Check/request mic permission on mount
   useEffect(() => {
     navigator.permissions?.query({ name: 'microphone' as PermissionName })
@@ -31,7 +65,6 @@ function App() {
         result.onchange = () => setMicPermission(result.state as 'prompt' | 'granted' | 'denied');
       })
       .catch(() => {
-        // Safari doesn't support permissions API for mic
         setMicPermission('prompt');
       });
   }, []);
@@ -55,10 +88,10 @@ function App() {
       role,
       text,
       audioUrl,
+      timestamp: Date.now(),
     }]);
   }, []);
 
-  // Pre-warm audio for Safari autoplay
   const playAudio = useCallback((url: string) => {
     if (audioRef.current) {
       audioRef.current.pause();
@@ -70,18 +103,16 @@ function App() {
     const audio = audioRef.current;
     audio.load();
     
-    // Try to play - Safari may still block this
     const playPromise = audio.play();
     if (playPromise) {
       playPromise.catch(err => {
         console.log('Autoplay blocked:', err);
-        // Audio will be available via play button
       });
     }
   }, []);
 
   const handleAudioSubmit = async (blob: Blob) => {
-    if (isProcessing) return; // Prevent double submission
+    if (isProcessing) return;
     
     setIsProcessing(true);
     addMessage('user', '🎤 [Voice message]');
@@ -119,11 +150,10 @@ function App() {
     }
   };
 
-  // Request mic permission explicitly (tap-to-enable)
   const requestMicPermission = async () => {
     try {
       const stream = await navigator.mediaDevices.getUserMedia({ audio: true });
-      stream.getTracks().forEach(t => t.stop()); // Release immediately
+      stream.getTracks().forEach(t => t.stop());
       setMicPermission('granted');
     } catch {
       setMicPermission('denied');
@@ -132,11 +162,16 @@ function App() {
 
   const handleStartRecording = () => {
     if (micPermission === 'prompt') {
-      // First time - this will show permission dialog
-      // User will need to tap again after granting
       requestMicPermission();
     } else if (micPermission === 'granted') {
       startRecording();
+    }
+  };
+
+  const clearHistory = () => {
+    if (confirm('Clear conversation history?')) {
+      setMessages([]);
+      localStorage.removeItem(STORAGE_KEY);
     }
   };
 
@@ -144,6 +179,11 @@ function App() {
     <div className="app">
       <header className="header">
         <h1>🎂 GLaDOS</h1>
+        {messages.length > 0 && (
+          <button className="clear-button" onClick={clearHistory} title="Clear history">
+            🗑️
+          </button>
+        )}
       </header>
 
       <main className="messages">
@@ -160,7 +200,13 @@ function App() {
         )}
         {messages.map(msg => (
           <div key={msg.id} className={`message ${msg.role}`}>
-            <div className="message-text">{msg.text}</div>
+            <div className="message-text">
+              {msg.role === 'assistant' ? (
+                <ReactMarkdown>{msg.text}</ReactMarkdown>
+              ) : (
+                msg.text
+              )}
+            </div>
             {msg.audioUrl && (
               <button 
                 className="play-button"
