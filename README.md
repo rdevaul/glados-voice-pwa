@@ -2,6 +2,18 @@
 
 A mobile-first Progressive Web App for voice interaction with [OpenClaw](https://github.com/openclaw/openclaw) AI assistants.
 
+## Repository Structure
+
+```
+├── src/              # React PWA frontend
+├── backend/          # FastAPI voice server
+│   ├── src/          # Python source
+│   ├── requirements.txt
+│   └── run.sh
+├── package.json      # Frontend dependencies
+└── README.md
+```
+
 ## Features
 
 - 🎤 **Push-to-talk voice input** — Hold to record, release to send
@@ -29,13 +41,26 @@ A mobile-first Progressive Web App for voice interaction with [OpenClaw](https:/
 ### Prerequisites
 
 - Node.js 18+
-- Voice API server running (see `voice-api/` in workspace)
+- Python 3.12+
+- [Whisper](https://github.com/openai/whisper) CLI for STT
+- [Piper](https://github.com/rhasspy/piper) TTS
+- [OpenClaw](https://github.com/openclaw/openclaw) configured
 
-### Development
+### Backend (Voice API)
+
+```bash
+cd backend
+python -m venv .venv
+source .venv/bin/activate
+pip install -r requirements.txt
+./run.sh  # Runs on port 8100
+```
+
+### Frontend (PWA)
 
 ```bash
 npm install
-npm run dev
+npm run dev  # Runs on port 5173
 ```
 
 ### Configuration
