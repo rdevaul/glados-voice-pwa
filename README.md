@@ -1,73 +1,80 @@
-# React + TypeScript + Vite
+# GLaDOS Voice PWA
 
-This template provides a minimal setup to get React working in Vite with HMR and some ESLint rules.
+A mobile-first Progressive Web App for voice interaction with [OpenClaw](https://github.com/openclaw/openclaw) AI assistants.
 
-Currently, two official plugins are available:
+## Features
 
-- [@vitejs/plugin-react](https://github.com/vitejs/vite-plugin-react/blob/main/packages/plugin-react) uses [Babel](https://babeljs.io/) (or [oxc](https://oxc.rs) when used in [rolldown-vite](https://vite.dev/guide/rolldown)) for Fast Refresh
-- [@vitejs/plugin-react-swc](https://github.com/vitejs/vite-plugin-react/blob/main/packages/plugin-react-swc) uses [SWC](https://swc.rs/) for Fast Refresh
+- 🎤 **Push-to-talk voice input** — Hold to record, release to send
+- 🔊 **Text-to-speech responses** — Hear responses via Piper TTS
+- ⌨️ **Text input fallback** — Type when voice isn't available
+- 📝 **Markdown rendering** — Formatted responses with code blocks, lists, etc.
+- 💾 **Conversation persistence** — History survives page reloads
+- 📱 **Mobile-first design** — Optimized for iPhone/Android
 
-## React Compiler
+## Architecture
 
-The React Compiler is not enabled on this template because of its impact on dev & build performances. To add it, see [this documentation](https://react.dev/learn/react-compiler/installation).
-
-## Expanding the ESLint configuration
-
-If you are developing a production application, we recommend updating the configuration to enable type-aware lint rules:
-
-```js
-export default defineConfig([
-  globalIgnores(['dist']),
-  {
-    files: ['**/*.{ts,tsx}'],
-    extends: [
-      // Other configs...
-
-      // Remove tseslint.configs.recommended and replace with this
-      tseslint.configs.recommendedTypeChecked,
-      // Alternatively, use this for stricter rules
-      tseslint.configs.strictTypeChecked,
-      // Optionally, add this for stylistic rules
-      tseslint.configs.stylisticTypeChecked,
-
-      // Other configs...
-    ],
-    languageOptions: {
-      parserOptions: {
-        project: ['./tsconfig.node.json', './tsconfig.app.json'],
-        tsconfigRootDir: import.meta.dirname,
-      },
-      // other options...
-    },
-  },
-])
+```
+┌─────────────────┐         ┌─────────────────────────────┐
+│   Voice PWA     │ ◄─────► │   Voice API Server          │
+│   (React)       │  HTTPS  │   (FastAPI)                 │
+│                 │         │                             │
+│   - Record      │         │   - Whisper STT             │
+│   - Playback    │         │   - Piper TTS               │
+│   - Chat UI     │         │   - OpenClaw integration    │
+└─────────────────┘         └─────────────────────────────┘
 ```
 
-You can also install [eslint-plugin-react-x](https://github.com/Rel1cx/eslint-react/tree/main/packages/plugins/eslint-plugin-react-x) and [eslint-plugin-react-dom](https://github.com/Rel1cx/eslint-react/tree/main/packages/plugins/eslint-plugin-react-dom) for React-specific lint rules:
+## Quick Start
 
-```js
-// eslint.config.js
-import reactX from 'eslint-plugin-react-x'
-import reactDom from 'eslint-plugin-react-dom'
+### Prerequisites
 
-export default defineConfig([
-  globalIgnores(['dist']),
-  {
-    files: ['**/*.{ts,tsx}'],
-    extends: [
-      // Other configs...
-      // Enable lint rules for React
-      reactX.configs['recommended-typescript'],
-      // Enable lint rules for React DOM
-      reactDom.configs.recommended,
-    ],
-    languageOptions: {
-      parserOptions: {
-        project: ['./tsconfig.node.json', './tsconfig.app.json'],
-        tsconfigRootDir: import.meta.dirname,
-      },
-      // other options...
-    },
-  },
-])
+- Node.js 18+
+- Voice API server running (see `voice-api/` in workspace)
+
+### Development
+
+```bash
+npm install
+npm run dev
 ```
+
+### Configuration
+
+Create `.env` file:
+
+```env
+VITE_API_URL=https://your-server:8444
+```
+
+### Production Build
+
+```bash
+npm run build
+npm run preview
+```
+
+## HTTPS Setup
+
+Voice recording requires HTTPS. Options:
+
+1. **Tailscale + mkcert** — Generate local certs, proxy with Caddy
+2. **Cloudflare Tunnel** — Public HTTPS without port forwarding
+3. **Let's Encrypt** — For public domains
+
+See the main OpenClaw docs for detailed setup.
+
+## Browser Support
+
+- ✅ Chrome (desktop & mobile)
+- ✅ Safari (iOS 15+)
+- ✅ Firefox
+- ⚠️ Safari may block autoplay — tap 🔊 to play responses
+
+## Related
+
+- [OpenClaw](https://github.com/openclaw/openclaw) — The AI assistant framework
+- Voice API server (companion backend)
+
+## License
+
+MIT
