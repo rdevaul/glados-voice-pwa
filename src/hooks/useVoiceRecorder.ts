@@ -6,6 +6,7 @@ interface UseVoiceRecorderReturn {
   stopRecording: () => void;
   audioBlob: Blob | null;
   error: string | null;
+  clearBlob: () => void;
 }
 
 export function useVoiceRecorder(): UseVoiceRecorderReturn {
@@ -14,20 +15,32 @@ export function useVoiceRecorder(): UseVoiceRecorderReturn {
   const [error, setError] = useState<string | null>(null);
   
   const mediaRecorderRef = useRef<MediaRecorder | null>(null);
+  const streamRef = useRef<MediaStream | null>(null);
   const chunksRef = useRef<Blob[]>([]);
 
+  const clearBlob = useCallback(() => {
+    setAudioBlob(null);
+  }, []);
+
   const startRecording = useCallback(async () => {
+    // Prevent starting if already recording
+    if (isRecording || mediaRecorderRef.current) return;
+    
     try {
       setError(null);
       setAudioBlob(null);
       chunksRef.current = [];
 
       const stream = await navigator.mediaDevices.getUserMedia({ audio: true });
+      streamRef.current = stream;
       
-      // Try webm first, fall back to wav
-      const mimeType = MediaRecorder.isTypeSupported('audio/webm;codecs=opus')
-        ? 'audio/webm;codecs=opus'
-        : 'audio/webm';
+      // Determine best supported format
+      let mimeType = 'audio/webm';
+      if (MediaRecorder.isTypeSupported('audio/webm;codecs=opus')) {
+        mimeType = 'audio/webm;codecs=opus';
+      } else if (MediaRecorder.isTypeSupported('audio/mp4')) {
+        mimeType = 'audio/mp4'; // Safari fallback
+      }
       
       const recorder = new MediaRecorder(stream, { mimeType });
       mediaRecorderRef.current = recorder;
@@ -41,23 +54,37 @@ export function useVoiceRecorder(): UseVoiceRecorderReturn {
       recorder.onstop = () => {
         const blob = new Blob(chunksRef.current, { type: mimeType });
         setAudioBlob(blob);
-        // Stop all tracks
-        stream.getTracks().forEach(track => track.stop());
+        
+        // Clean up stream
+        if (streamRef.current) {
+          streamRef.current.getTracks().forEach(track => track.stop());
+          streamRef.current = null;
+        }
+        mediaRecorderRef.current = null;
       };
 
-      recorder.start();
+      recorder.onerror = (e) => {
+        console.error('MediaRecorder error:', e);
+        setError('Recording failed');
+        setIsRecording(false);
+      };
+
+      // Request data every 250ms for more responsive recording
+      recorder.start(250);
       setIsRecording(true);
     } catch (err) {
-      setError(err instanceof Error ? err.message : 'Failed to start recording');
-    }
-  }, []);
-
-  const stopRecording = useCallback(() => {
-    if (mediaRecorderRef.current && isRecording) {
-      mediaRecorderRef.current.stop();
-      setIsRecording(false);
+      const message = err instanceof Error ? err.message : 'Failed to start recording';
+      setError(message);
+      console.error('Recording error:', err);
     }
   }, [isRecording]);
 
-  return { isRecording, startRecording, stopRecording, audioBlob, error };
+  const stopRecording = useCallback(() => {
+    if (mediaRecorderRef.current && mediaRecorderRef.current.state !== 'inactive') {
+      mediaRecorderRef.current.stop();
+      setIsRecording(false);
+    }
+  }, []);
+
+  return { isRecording, startRecording, stopRecording, audioBlob, error, clearBlob };
 }
