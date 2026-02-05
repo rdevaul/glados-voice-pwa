@@ -11,6 +11,9 @@ from fastapi import FastAPI, WebSocket, WebSocketDisconnect
 from pydantic import BaseModel, Field
 from starlette.websockets import WebSocketState
 
+from .transcribe import ChunkedTranscriber
+from .stream_response import stream_chat_response
+
 logging.basicConfig(level=logging.DEBUG)
 logger = logging.getLogger(__name__)
 
@@ -86,12 +89,18 @@ class WebSocketManager:
         self.active_connections: Dict[str, WebSocket] = {}
         self.audio_buffers: Dict[str, bytearray] = {}
         self.audio_formats: Dict[str, str] = {}
+        self.transcribers: Dict[str, ChunkedTranscriber] = {}
 
     async def connect(self, websocket: WebSocket, session_id: str):
         """Accept connection and send ready message."""
         await websocket.accept()
         self.active_connections[session_id] = websocket
         self.audio_buffers[session_id] = bytearray()
+        self.transcribers[session_id] = ChunkedTranscriber(
+            chunk_duration_ms=3000,
+            overlap_ms=500,
+            model="base"
+        )
         
         ready_message = ReadyMessage(session_id=session_id)
         await websocket.send_json(ready_message.dict())
@@ -105,6 +114,8 @@ class WebSocketManager:
             del self.audio_buffers[session_id]
         if session_id in self.audio_formats:
             del self.audio_formats[session_id]
+        if session_id in self.transcribers:
+            del self.transcribers[session_id]
         logger.info(f"Client disconnected: {session_id}")
 
     async def send_message(self, message: BaseModel, session_id: str):
@@ -123,6 +134,10 @@ class WebSocketManager:
                 audio_start = AudioStartMessage(**data)
                 self.audio_formats[session_id] = audio_start.format
                 self.audio_buffers[session_id] = bytearray()
+                # Configure transcriber for this format
+                if session_id in self.transcribers:
+                    self.transcribers[session_id].set_format(audio_start.format)
+                    self.transcribers[session_id].reset()
                 logger.debug(f"Audio start: format={audio_start.format}")
                 
             elif msg_type == "audio_end":
@@ -175,60 +190,109 @@ class WebSocketManager:
 
         logger.info(f"Processing {len(audio_data)} bytes of {audio_format} audio")
         
-        # TODO: Implement streaming transcription
-        # For now, send placeholder
+        # Get or create transcriber
+        transcriber = self.transcribers.get(session_id)
+        if not transcriber:
+            transcriber = ChunkedTranscriber()
+            transcriber.set_format(audio_format)
+            self.transcribers[session_id] = transcriber
+        
+        # Send partial transcript notification
         await self.send_message(
-            PartialTranscriptMessage(text="Processing audio...", is_final=False),
+            PartialTranscriptMessage(text="Transcribing...", is_final=False),
             session_id
         )
         
-        # Placeholder - will be replaced with actual transcription
+        # Feed all buffered audio to transcriber and finalize
+        transcriber.audio_buffer = bytearray(audio_data)
+        transcript = await transcriber.finalize()
+        
+        if not transcript:
+            transcript = "[Could not transcribe audio]"
+            
+        logger.info(f"Transcribed: {transcript[:100]}...")
+        
+        # Send final transcript
         await self.send_message(
-            FinalTranscriptMessage(text="[Transcription placeholder]"),
+            FinalTranscriptMessage(text=transcript),
             session_id
         )
         
-        # Placeholder response
-        await self.send_message(
-            ResponseChunkMessage(text="I received your ", accumulated="I received your "),
-            session_id
-        )
-        await self.send_message(
-            ResponseChunkMessage(text="audio message.", accumulated="I received your audio message."),
-            session_id
-        )
-        await self.send_message(
-            ResponseCompleteMessage(
-                text="I received your audio message.",
-                audio_url="/voice/audio/placeholder.wav"
-            ),
-            session_id
-        )
+        # Process the transcript through chat
+        await self._process_text(session_id, transcript)
         
         # Clear buffer
         self.audio_buffers[session_id] = bytearray()
 
     async def _process_text(self, session_id: str, text: str):
-        """Process text input and generate response."""
+        """Process text input and generate response via OpenClaw."""
         logger.info(f"Processing text: {text[:50]}...")
         
-        # TODO: Implement streaming response
-        # For now, send placeholder
-        await self.send_message(
-            ResponseChunkMessage(text="Processing ", accumulated="Processing "),
-            session_id
-        )
-        await self.send_message(
-            ResponseChunkMessage(text="your message...", accumulated="Processing your message..."),
-            session_id
-        )
-        await self.send_message(
-            ResponseCompleteMessage(
-                text="Processing your message...",
-                audio_url="/voice/audio/placeholder.wav"
-            ),
-            session_id
-        )
+        accumulated = ""
+        
+        try:
+            # Stream response chunks from OpenClaw
+            async for chunk in stream_chat_response(text, session_id="voice"):
+                accumulated += (" " if accumulated else "") + chunk
+                
+                await self.send_message(
+                    ResponseChunkMessage(text=chunk, accumulated=accumulated),
+                    session_id
+                )
+            
+            # Generate TTS for the response
+            audio_url = await self._generate_tts(accumulated)
+            
+            await self.send_message(
+                ResponseCompleteMessage(
+                    text=accumulated,
+                    audio_url=audio_url
+                ),
+                session_id
+            )
+            
+        except Exception as e:
+            logger.exception(f"Error processing text: {e}")
+            await self.send_message(
+                ErrorMessage(code="processing_error", message=str(e)),
+                session_id
+            )
+
+    async def _generate_tts(self, text: str) -> str:
+        """Generate TTS audio for response text."""
+        import uuid
+        from pathlib import Path
+        
+        # Use the existing TTS setup from main.py
+        audio_id = uuid.uuid4().hex
+        output_dir = Path("audio_cache")
+        output_dir.mkdir(exist_ok=True)
+        output_file = output_dir / f"{audio_id}.wav"
+        
+        # Escape text for shell
+        safe_text = text.replace('"', '\\"').replace("'", "'\\''")
+        
+        # Piper TTS command
+        piper_cmd = f'eval "$(pyenv init -)" && echo "{safe_text}" | piper -m /Users/rich/Projects/piper-models/en_US-lessac-medium.onnx -f {output_file}'
+        
+        try:
+            process = await asyncio.create_subprocess_shell(
+                piper_cmd,
+                stdout=asyncio.subprocess.PIPE,
+                stderr=asyncio.subprocess.PIPE
+            )
+            
+            await asyncio.wait_for(process.communicate(), timeout=30)
+            
+            if output_file.exists():
+                return f"/voice/audio/{audio_id}.wav"
+            else:
+                logger.error("Piper did not produce output file")
+                return "/voice/audio/error.wav"
+                
+        except Exception as e:
+            logger.exception(f"TTS error: {e}")
+            return "/voice/audio/error.wav"
 
 
 # Singleton instance
