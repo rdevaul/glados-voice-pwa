@@ -13,7 +13,11 @@ import uuid
 from pathlib import Path
 from typing import Optional
 
-app = FastAPI(title="GLaDOS Voice API", version="0.1.0")
+app = FastAPI(title="GLaDOS Voice API", version="0.2.0-streaming")
+
+# Register WebSocket routes for streaming
+from .websocket import register_websocket_routes
+register_websocket_routes(app)
 
 # Enable CORS for PWA access
 app.add_middleware(
