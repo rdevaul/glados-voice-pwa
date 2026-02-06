@@ -204,7 +204,9 @@ class WebSocketManager:
         )
         
         # Feed all buffered audio to transcriber and finalize
+        logger.info(f"Setting transcriber buffer with {len(audio_data)} bytes")
         transcriber.audio_buffer = bytearray(audio_data)
+        logger.info(f"Transcriber buffer size: {len(transcriber.audio_buffer)} bytes")
         transcript = await transcriber.finalize()
         
         if not transcript:

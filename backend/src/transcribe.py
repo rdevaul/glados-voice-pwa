@@ -132,6 +132,15 @@ class ChunkedTranscriber:
         try:
             input_file.write_bytes(audio_to_process)
             
+            # Debug: verify file was written correctly
+            actual_size = input_file.stat().st_size
+            logger.info(f"Wrote {len(audio_to_process)} bytes, file size: {actual_size} bytes, path: {input_file}")
+            
+            # Debug: save a copy for analysis
+            debug_file = tmp_dir / f"debug_audio_{tmp_id}.{self.audio_format}"
+            debug_file.write_bytes(audio_to_process)
+            logger.info(f"Debug copy saved to {debug_file}")
+            
             # Run Whisper
             cmd = f"whisper {input_file} --model {self.model} --language {self.language} --output_format txt --output_dir {output_dir}"
             

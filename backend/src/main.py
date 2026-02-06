@@ -4,8 +4,9 @@ FastAPI server providing STT (Whisper) and TTS (Piper) endpoints.
 """
 
 from fastapi import FastAPI, File, UploadFile, HTTPException
-from fastapi.responses import JSONResponse, FileResponse
+from fastapi.responses import JSONResponse, FileResponse, HTMLResponse
 from fastapi.middleware.cors import CORSMiddleware
+from fastapi.staticfiles import StaticFiles
 from pydantic import BaseModel
 import subprocess
 import os
@@ -31,6 +32,19 @@ app.add_middleware(
 # Directory setup
 AUDIO_CACHE_DIR = Path("audio_cache")
 AUDIO_CACHE_DIR.mkdir(exist_ok=True)
+
+# Static files directory (for test page)
+STATIC_DIR = Path(__file__).parent.parent / "static"
+STATIC_DIR.mkdir(exist_ok=True)
+
+
+@app.get("/test", response_class=HTMLResponse)
+async def test_page():
+    """Serve the WebSocket test page."""
+    test_file = STATIC_DIR / "test.html"
+    if test_file.exists():
+        return HTMLResponse(content=test_file.read_text())
+    return HTMLResponse(content="<h1>Test page not found</h1>", status_code=404)
 
 # External command templates
 WHISPER_CMD = "whisper {input_file} --model base --output_format txt --output_dir {output_dir}"
