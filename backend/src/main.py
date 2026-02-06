@@ -14,6 +14,8 @@ import uuid
 from pathlib import Path
 from typing import Optional
 
+from .utils import strip_markdown
+
 app = FastAPI(title="GLaDOS Voice API", version="0.2.0-streaming")
 
 # Register WebSocket routes for streaming
@@ -130,8 +132,9 @@ async def speak(request: SpeakRequest):
     audio_id = uuid.uuid4().hex
     output_file_path = AUDIO_CACHE_DIR / f"{audio_id}.wav"
     
-    # Escape quotes in text for shell
-    safe_text = request.text.replace('"', '\\"').replace("'", "'\\''")
+    # Strip markdown and escape quotes for shell
+    clean_text = strip_markdown(request.text)
+    safe_text = clean_text.replace('"', '\\"').replace("'", "'\\''")
     
     piper_command = PIPER_CMD.format(
         text=safe_text,
@@ -264,11 +267,12 @@ async def _process_chat(user_text: str):
         print(f"[VOICE] Exception: {e}")
         response_text = f"I heard: {user_text}. Error: {str(e)}"
     
-    # Generate TTS for response
+    # Generate TTS for response - strip markdown for cleaner speech
     audio_id = uuid.uuid4().hex
     output_file_path = AUDIO_CACHE_DIR / f"{audio_id}.wav"
     
-    safe_text = response_text.replace('"', '\\"').replace("'", "'\\''")
+    clean_text = strip_markdown(response_text)
+    safe_text = clean_text.replace('"', '\\"').replace("'", "'\\''")
     piper_command = PIPER_CMD.format(
         text=safe_text,
         output_file=output_file_path

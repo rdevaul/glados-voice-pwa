@@ -136,29 +136,54 @@ function App() {
   useEffect(() => {
     if (!useStreaming) return;
     
-    if (stream.responseText && currentAssistantMsgRef.current) {
+    const msgId = currentAssistantMsgRef.current;
+    
+    if (stream.responseText && msgId) {
       // Update assistant message with streaming text
+      const latestAudioUrl = stream.audioQueue.length > 0 
+        ? getAudioUrl(stream.audioQueue[stream.audioQueue.length - 1])
+        : undefined;
+        
       setMessages(prev => prev.map(m => 
-        m.id === currentAssistantMsgRef.current
-          ? { ...m, text: stream.responseText, streaming: !stream.responseComplete }
+        m.id === msgId
+          ? { 
+              ...m, 
+              text: stream.responseText, 
+              streaming: !stream.responseComplete,
+              audioUrl: stream.responseComplete ? latestAudioUrl : m.audioUrl
+            }
           : m
       ));
+      
+      // Only clear the ref AFTER updating the message with final state
+      if (stream.responseComplete) {
+        setIsProcessing(false);
+        currentAssistantMsgRef.current = null;
+      }
     }
-    
-    if (stream.responseComplete) {
-      setIsProcessing(false);
-      currentAssistantMsgRef.current = null;
-    }
-  }, [stream.responseText, stream.responseComplete, useStreaming]);
+  }, [stream.responseText, stream.responseComplete, stream.audioQueue, useStreaming]);
 
   // Handle audio queue for streaming responses
+  const lastAudioIndexRef = useRef(0);
+  const lastAudioQueueLengthRef = useRef(0);
+  
   useEffect(() => {
     if (!useStreaming) return;
     
-    stream.audioQueue.forEach(url => {
+    // Detect if queue was cleared (length went to 0 or decreased significantly)
+    if (stream.audioQueue.length === 0 || stream.audioQueue.length < lastAudioQueueLengthRef.current) {
+      lastAudioIndexRef.current = 0;
+    }
+    lastAudioQueueLengthRef.current = stream.audioQueue.length;
+    
+    // Only process new audio URLs (avoid re-adding on every render)
+    const newUrls = stream.audioQueue.slice(lastAudioIndexRef.current);
+    newUrls.forEach(url => {
       const fullUrl = getAudioUrl(url);
+      console.log('Enqueueing audio:', fullUrl);
       audioQueue.current.enqueue(fullUrl);
     });
+    lastAudioIndexRef.current = stream.audioQueue.length;
   }, [stream.audioQueue, useStreaming]);
 
   // Handle batch mode audio blob

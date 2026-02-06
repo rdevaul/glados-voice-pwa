@@ -13,6 +13,7 @@ from starlette.websockets import WebSocketState
 
 from .transcribe import ChunkedTranscriber
 from .stream_response import stream_chat_response
+from .main import strip_markdown
 
 logging.basicConfig(level=logging.DEBUG)
 logger = logging.getLogger(__name__)
@@ -244,6 +245,7 @@ class WebSocketManager:
             
             # Generate TTS for the response
             audio_url = await self._generate_tts(accumulated)
+            logger.info(f"Generated TTS audio_url: {audio_url}")
             
             await self.send_message(
                 ResponseCompleteMessage(
@@ -252,6 +254,7 @@ class WebSocketManager:
                 ),
                 session_id
             )
+            logger.info(f"Sent response_complete with audio_url: {audio_url}")
             
         except Exception as e:
             logger.exception(f"Error processing text: {e}")
@@ -271,8 +274,9 @@ class WebSocketManager:
         output_dir.mkdir(exist_ok=True)
         output_file = output_dir / f"{audio_id}.wav"
         
-        # Escape text for shell
-        safe_text = text.replace('"', '\\"').replace("'", "'\\''")
+        # Strip markdown and escape text for shell
+        clean_text = strip_markdown(text)
+        safe_text = clean_text.replace('"', '\\"').replace("'", "'\\''")
         
         # Piper TTS command
         piper_cmd = f'eval "$(pyenv init -)" && echo "{safe_text}" | piper -m /Users/rich/Projects/piper-models/en_US-lessac-medium.onnx -f {output_file}'
