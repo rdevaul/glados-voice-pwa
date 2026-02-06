@@ -35,9 +35,28 @@ body {
   font-weight: 600;
 }
 
-.clear-button {
+.header-controls {
   position: absolute;
   right: 16px;
+  display: flex;
+  align-items: center;
+  gap: 8px;
+}
+
+.status-button {
+  background: none;
+  border: none;
+  font-size: 16px;
+  cursor: pointer;
+  padding: 8px;
+  opacity: 0.8;
+}
+
+.status-button:hover {
+  opacity: 1;
+}
+
+.clear-button {
   background: none;
   border: none;
   font-size: 18px;
@@ -90,6 +109,21 @@ body {
 .message-text {
   flex: 1;
   overflow-wrap: break-word;
+}
+
+.message.streaming .message-text {
+  color: #94a3b8;
+}
+
+.typing-indicator {
+  display: inline-block;
+  animation: blink 1s infinite;
+  color: #3b82f6;
+}
+
+@keyframes blink {
+  0%, 50% { opacity: 1; }
+  51%, 100% { opacity: 0; }
 }
 
 .message.pending {

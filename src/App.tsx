@@ -1,8 +1,10 @@
 import { useState, useEffect, useRef, useCallback } from 'react';
 import ReactMarkdown from 'react-markdown';
 import { useVoiceRecorder } from './hooks/useVoiceRecorder';
+import { useVoiceStream } from './hooks/useVoiceStream';
 import { PushToTalkButton } from './components/PushToTalkButton';
 import { chatWithText, chatWithAudio, getAudioUrl } from './api/voiceApi';
+import { getAudioQueue } from './utils/audioQueue';
 import './App.css';
 
 interface Message {
@@ -10,20 +12,27 @@ interface Message {
   role: 'user' | 'assistant';
   text: string;
   audioUrl?: string;
-  audioBlobUrl?: string; // For user recordings (temporary, not persisted)
+  audioBlobUrl?: string;
   timestamp: number;
   pending?: boolean;
+  streaming?: boolean;
 }
 
 const STORAGE_KEY = 'glados-voice-history';
 const MAX_STORED_MESSAGES = 50;
 
+// WebSocket URL for streaming mode
+const WS_URL = import.meta.env.VITE_WS_URL || 
+  `wss://${window.location.hostname}:8444/voice/stream`;
+
+// Feature flag for streaming mode
+const STREAMING_ENABLED = import.meta.env.VITE_STREAMING_ENABLED !== 'false';
+
 function loadMessages(): Message[] {
   try {
     const stored = localStorage.getItem(STORAGE_KEY);
     if (stored) {
-      // Filter out any pending messages that weren't completed
-      return JSON.parse(stored).filter((m: Message) => !m.pending);
+      return JSON.parse(stored).filter((m: Message) => !m.pending && !m.streaming);
     }
   } catch (e) {
     console.error('Failed to load messages:', e);
@@ -33,11 +42,10 @@ function loadMessages(): Message[] {
 
 function saveMessages(messages: Message[]) {
   try {
-    // Don't save audioBlobUrls (they're temporary) or pending messages
     const toStore = messages
-      .filter(m => !m.pending)
+      .filter(m => !m.pending && !m.streaming)
       .slice(-MAX_STORED_MESSAGES)
-      .map(({ audioBlobUrl, ...rest }) => rest);
+      .map(({ audioBlobUrl, streaming, ...rest }) => rest);
     localStorage.setItem(STORAGE_KEY, JSON.stringify(toStore));
   } catch (e) {
     console.error('Failed to save messages:', e);
@@ -49,29 +57,53 @@ function App() {
   const [textInput, setTextInput] = useState('');
   const [isProcessing, setIsProcessing] = useState(false);
   const [micPermission, setMicPermission] = useState<'prompt' | 'granted' | 'denied'>('prompt');
+  const [useStreaming, setUseStreaming] = useState(STREAMING_ENABLED);
   
   const messagesEndRef = useRef<HTMLDivElement>(null);
   const audioRef = useRef<HTMLAudioElement | null>(null);
   const processedBlobRef = useRef<Blob | null>(null);
   const abortControllerRef = useRef<AbortController | null>(null);
+  const currentAssistantMsgRef = useRef<string | null>(null);
   
-  const { isRecording, startRecording, stopRecording, audioBlob, error } = useVoiceRecorder();
+  // Batch mode hooks
+  const { isRecording: batchIsRecording, startRecording: batchStartRecording, 
+          stopRecording: batchStopRecording, audioBlob, error: batchError } = useVoiceRecorder();
+  
+  // Streaming mode hooks
+  const stream = useVoiceStream(WS_URL);
+  const audioQueue = useRef(getAudioQueue());
 
-  // Save messages whenever they change (but not pending ones)
+  // Determine which mode we're using
+  const isRecording = useStreaming ? stream.status === 'recording' : batchIsRecording;
+  const error = useStreaming ? stream.error : batchError;
+  const isConnected = stream.status !== 'disconnected';
+  const isStreamProcessing = stream.status === 'processing';
+
+  // Connect to WebSocket on mount if streaming enabled
+  useEffect(() => {
+    if (useStreaming && stream.status === 'disconnected') {
+      stream.connect();
+    }
+    return () => {
+      if (useStreaming) {
+        stream.disconnect();
+      }
+    };
+  }, [useStreaming]);
+
+  // Save messages whenever they change
   useEffect(() => {
     saveMessages(messages);
   }, [messages]);
 
-  // Check/request mic permission on mount
+  // Check mic permission on mount
   useEffect(() => {
     navigator.permissions?.query({ name: 'microphone' as PermissionName })
       .then(result => {
         setMicPermission(result.state as 'prompt' | 'granted' | 'denied');
         result.onchange = () => setMicPermission(result.state as 'prompt' | 'granted' | 'denied');
       })
-      .catch(() => {
-        setMicPermission('prompt');
-      });
+      .catch(() => setMicPermission('prompt'));
   }, []);
 
   // Scroll to bottom on new messages
@@ -79,15 +111,65 @@ function App() {
     messagesEndRef.current?.scrollIntoView({ behavior: 'smooth' });
   }, [messages]);
 
-  // Handle audio blob when recording completes
+  // Handle streaming transcript updates
   useEffect(() => {
-    if (audioBlob && !isRecording && audioBlob !== processedBlobRef.current) {
-      processedBlobRef.current = audioBlob;
-      handleAudioSubmit(audioBlob);
+    if (!useStreaming) return;
+    
+    if (stream.finalTranscript) {
+      // Update user message with final transcript
+      setMessages(prev => prev.map(m => 
+        m.pending && m.role === 'user' 
+          ? { ...m, text: stream.finalTranscript, pending: false }
+          : m
+      ));
+    } else if (stream.partialTranscript) {
+      // Update user message with partial transcript
+      setMessages(prev => prev.map(m => 
+        m.pending && m.role === 'user' 
+          ? { ...m, text: `🎤 ${stream.partialTranscript}` }
+          : m
+      ));
     }
-  }, [audioBlob, isRecording]);
+  }, [stream.partialTranscript, stream.finalTranscript, useStreaming]);
 
-  // Cleanup abort controller on unmount
+  // Handle streaming response updates
+  useEffect(() => {
+    if (!useStreaming) return;
+    
+    if (stream.responseText && currentAssistantMsgRef.current) {
+      // Update assistant message with streaming text
+      setMessages(prev => prev.map(m => 
+        m.id === currentAssistantMsgRef.current
+          ? { ...m, text: stream.responseText, streaming: !stream.responseComplete }
+          : m
+      ));
+    }
+    
+    if (stream.responseComplete) {
+      setIsProcessing(false);
+      currentAssistantMsgRef.current = null;
+    }
+  }, [stream.responseText, stream.responseComplete, useStreaming]);
+
+  // Handle audio queue for streaming responses
+  useEffect(() => {
+    if (!useStreaming) return;
+    
+    stream.audioQueue.forEach(url => {
+      const fullUrl = getAudioUrl(url);
+      audioQueue.current.enqueue(fullUrl);
+    });
+  }, [stream.audioQueue, useStreaming]);
+
+  // Handle batch mode audio blob
+  useEffect(() => {
+    if (!useStreaming && audioBlob && !batchIsRecording && audioBlob !== processedBlobRef.current) {
+      processedBlobRef.current = audioBlob;
+      handleBatchAudioSubmit(audioBlob);
+    }
+  }, [audioBlob, batchIsRecording, useStreaming]);
+
+  // Cleanup on unmount
   useEffect(() => {
     return () => {
       abortControllerRef.current?.abort();
@@ -113,6 +195,9 @@ function App() {
   const playAudio = useCallback((url: string) => {
     if (!url) return;
     
+    // Warm up audio queue on first interaction
+    audioQueue.current.warmUp();
+    
     if (audioRef.current) {
       audioRef.current.pause();
       audioRef.current.src = url;
@@ -120,32 +205,60 @@ function App() {
       audioRef.current = new Audio(url);
     }
     
-    const audio = audioRef.current;
-    audio.load();
-    
-    const playPromise = audio.play();
-    if (playPromise) {
-      playPromise.catch(err => {
-        console.log('Autoplay blocked:', err);
-      });
-    }
+    audioRef.current.play().catch(err => console.log('Autoplay blocked:', err));
   }, []);
 
-  const handleAudioSubmit = async (blob: Blob) => {
+  // Streaming mode handlers
+  const handleStreamingStart = async () => {
+    if (stream.status !== 'ready') return;
+    
+    setIsProcessing(true);
+    stream.clearResponse();
+    
+    // Add pending user message
+    addMessage('user', '🎤 Recording...', { pending: true });
+    
+    // Add placeholder assistant message for streaming
+    const assistantId = addMessage('assistant', '...', { streaming: true });
+    currentAssistantMsgRef.current = assistantId;
+    
+    await stream.startRecording();
+  };
+
+  const handleStreamingStop = () => {
+    stream.stopRecording();
+  };
+
+  const handleStreamingTextSubmit = (e: React.FormEvent) => {
+    e.preventDefault();
+    if (!textInput.trim() || stream.status !== 'ready') return;
+
+    const text = textInput.trim();
+    setTextInput('');
+    setIsProcessing(true);
+    stream.clearResponse();
+    
+    // Add user message
+    addMessage('user', text);
+    
+    // Add placeholder assistant message
+    const assistantId = addMessage('assistant', '...', { streaming: true });
+    currentAssistantMsgRef.current = assistantId;
+    
+    stream.sendText(text);
+  };
+
+  // Batch mode handlers (existing logic)
+  const handleBatchAudioSubmit = async (blob: Blob) => {
     if (isProcessing) return;
     
     setIsProcessing(true);
-    
-    // Create a temporary URL for the user's recording
     const userAudioUrl = URL.createObjectURL(blob);
-    
-    // Add user message with pending transcript
     const userMsgId = addMessage('user', '🎤 Transcribing...', {
       audioBlobUrl: userAudioUrl,
       pending: true,
     });
     
-    // Cancel any existing request
     abortControllerRef.current?.abort();
     abortControllerRef.current = new AbortController();
     
@@ -153,39 +266,28 @@ function App() {
       const response = await chatWithAudio(blob);
       const audioUrl = getAudioUrl(response.audio_url);
       
-      // Update user message with transcript
-      const transcript = response.user_text || '🎤 [Voice message]';
       updateMessage(userMsgId, { 
-        text: transcript, 
+        text: response.user_text || '🎤 [Voice message]', 
         pending: false 
       });
       
-      // Add assistant response
       addMessage('assistant', response.text, { audioUrl });
       playAudio(audioUrl);
     } catch (err) {
-      if (err instanceof Error && err.name === 'AbortError') {
-        // Request was cancelled, don't show error
-        return;
-      }
+      if (err instanceof Error && err.name === 'AbortError') return;
       
-      const errorMsg = err instanceof Error ? err.message : 'Unknown error';
-      
-      // Update user message to show it was sent
       updateMessage(userMsgId, { 
         text: '🎤 [Voice message - transcript unavailable]', 
         pending: false 
       });
-      
-      // Add error message with retry option
-      addMessage('assistant', `Error: ${errorMsg}. Tap to retry or send another message.`);
+      addMessage('assistant', `Error: ${err instanceof Error ? err.message : 'Unknown error'}`);
     } finally {
       setIsProcessing(false);
       abortControllerRef.current = null;
     }
   };
 
-  const handleTextSubmit = async (e: React.FormEvent) => {
+  const handleBatchTextSubmit = async (e: React.FormEvent) => {
     e.preventDefault();
     if (!textInput.trim() || isProcessing) return;
 
@@ -206,9 +308,7 @@ function App() {
       addMessage('assistant', response.text, { audioUrl });
       playAudio(audioUrl);
     } catch (err) {
-      if (err instanceof Error && err.name === 'AbortError') {
-        return;
-      }
+      if (err instanceof Error && err.name === 'AbortError') return;
       
       updateMessage(userMsgId, { pending: false });
       addMessage('assistant', `Error: ${err instanceof Error ? err.message : 'Unknown error'}`);
@@ -229,12 +329,29 @@ function App() {
   };
 
   const handleStartRecording = () => {
+    // Warm up audio on user gesture
+    audioQueue.current.warmUp();
+    
     if (micPermission === 'prompt') {
       requestMicPermission();
     } else if (micPermission === 'granted') {
-      startRecording();
+      if (useStreaming) {
+        handleStreamingStart();
+      } else {
+        batchStartRecording();
+      }
     }
   };
+
+  const handleStopRecording = () => {
+    if (useStreaming) {
+      handleStreamingStop();
+    } else {
+      batchStopRecording();
+    }
+  };
+
+  const handleTextSubmit = useStreaming ? handleStreamingTextSubmit : handleBatchTextSubmit;
 
   const clearHistory = () => {
     if (confirm('Clear conversation history?')) {
@@ -243,21 +360,54 @@ function App() {
     }
   };
 
+  const toggleStreamingMode = () => {
+    if (useStreaming) {
+      stream.disconnect();
+    }
+    setUseStreaming(!useStreaming);
+  };
+
+  // Connection status indicator
+  const getStatusIcon = () => {
+    if (!useStreaming) return '📡'; // Batch mode
+    switch (stream.status) {
+      case 'disconnected': return '🔴';
+      case 'connecting': return '🟡';
+      case 'ready': return '🟢';
+      case 'recording': return '🔴';
+      case 'processing': return '🔵';
+      default: return '⚪';
+    }
+  };
+
   return (
     <div className="app">
       <header className="header">
         <h1>🎂 GLaDOS</h1>
-        {messages.length > 0 && (
-          <button className="clear-button" onClick={clearHistory} title="Clear history">
-            🗑️
+        <div className="header-controls">
+          <button 
+            className="status-button" 
+            onClick={toggleStreamingMode}
+            title={useStreaming ? `Streaming: ${stream.status}` : 'Batch mode'}
+          >
+            {getStatusIcon()}
           </button>
-        )}
+          {messages.length > 0 && (
+            <button className="clear-button" onClick={clearHistory} title="Clear history">
+              🗑️
+            </button>
+          )}
+        </div>
       </header>
 
       <main className="messages">
         {messages.length === 0 && (
           <div className="empty-state">
-            {micPermission === 'prompt' ? (
+            {!useStreaming ? (
+              <>Batch mode. Tap status icon to switch to streaming.</>
+            ) : !isConnected ? (
+              <>Connecting to voice server...</>
+            ) : micPermission === 'prompt' ? (
               <>Tap the mic button to enable voice, or type below.</>
             ) : micPermission === 'denied' ? (
               <>Mic access denied. Use text input below.</>
@@ -267,33 +417,30 @@ function App() {
           </div>
         )}
         {messages.map(msg => (
-          <div key={msg.id} className={`message ${msg.role} ${msg.pending ? 'pending' : ''}`}>
+          <div key={msg.id} className={`message ${msg.role} ${msg.pending ? 'pending' : ''} ${msg.streaming ? 'streaming' : ''}`}>
             <div className="message-text">
               {msg.role === 'assistant' ? (
                 <ReactMarkdown>{msg.text}</ReactMarkdown>
               ) : (
                 msg.text
               )}
+              {msg.streaming && <span className="typing-indicator">▋</span>}
             </div>
             <div className="message-actions">
-              {/* User voice message playback */}
               {msg.audioBlobUrl && (
                 <button 
                   className="play-button"
                   onClick={() => playAudio(msg.audioBlobUrl!)}
                   aria-label="Play your recording"
-                  title="Play your recording"
                 >
                   🎤
                 </button>
               )}
-              {/* Assistant audio playback */}
               {msg.audioUrl && (
                 <button 
                   className="play-button"
                   onClick={() => playAudio(msg.audioUrl!)}
                   aria-label="Play response"
-                  title="Play response"
                 >
                   🔊
                 </button>
@@ -310,8 +457,8 @@ function App() {
         <PushToTalkButton
           isRecording={isRecording}
           onStartRecording={handleStartRecording}
-          onStopRecording={stopRecording}
-          disabled={isProcessing || micPermission === 'denied'}
+          onStopRecording={handleStopRecording}
+          disabled={isProcessing || isStreamProcessing || micPermission === 'denied' || (useStreaming && !isConnected)}
         />
         
         <form className="text-input-form" onSubmit={handleTextSubmit}>
@@ -320,9 +467,12 @@ function App() {
             value={textInput}
             onChange={(e) => setTextInput(e.target.value)}
             placeholder="Or type here..."
-            disabled={isProcessing}
+            disabled={isProcessing || (useStreaming && !isConnected)}
           />
-          <button type="submit" disabled={isProcessing || !textInput.trim()}>
+          <button 
+            type="submit" 
+            disabled={isProcessing || !textInput.trim() || (useStreaming && !isConnected)}
+          >
             Send
           </button>
         </form>
