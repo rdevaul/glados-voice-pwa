@@ -162,10 +162,26 @@ class WebSocketManager:
         if session and session.audio_format:
             self.transcribers[session_id].set_format(session.audio_format)
         
-        # Send ready message
-        ready_message = ReadyMessage(session_id=session_id)
-        await websocket.send_json(ready_message.dict())
-        logger.info(f"Client connected: {session_id}")
+        # Check for pending messages (indicates a restore with queued data)
+        pending = await session_store.get_pending_messages(session_id)
+        
+        if pending:
+            # Send session_restored with pending messages
+            restored_msg = SessionRestoredMessage(
+                session_id=session_id,
+                pending_messages=pending,
+                state=session.state if session else 'idle',
+                partial_transcript=session.partial_transcript if session else '',
+                partial_response=session.partial_response if session else '',
+            )
+            await websocket.send_json(restored_msg.dict())
+            await session_store.clear_pending_messages(session_id)
+            logger.info(f"Client reconnected with {len(pending)} pending messages: {session_id}")
+        else:
+            # Normal connection - send ready message
+            ready_message = ReadyMessage(session_id=session_id)
+            await websocket.send_json(ready_message.dict())
+            logger.info(f"Client connected: {session_id}")
         
         return session_id
 
