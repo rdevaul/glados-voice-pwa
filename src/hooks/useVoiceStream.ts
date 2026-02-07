@@ -427,15 +427,10 @@ export function useVoiceStream(wsUrl: string): UseVoiceStreamReturn {
     };
   }, [saveState, connect]);
 
-  // Cleanup on unmount
+  // Cleanup on unmount ONLY - empty deps array means this only runs on unmount
   useEffect(() => {
     return () => {
       shouldReconnectRef.current = false;
-      
-      // Save state before unmount
-      if (sessionIdRef.current) {
-        saveState();
-      }
       
       if (wsRef.current) {
         wsRef.current.close();
@@ -449,7 +444,7 @@ export function useVoiceStream(wsUrl: string): UseVoiceStreamReturn {
         streamRef.current.getTracks().forEach(track => track.stop());
       }
     };
-  }, [saveState]);
+  }, []);  // Empty array = only on unmount, not on state changes
 
   return {
     status,
