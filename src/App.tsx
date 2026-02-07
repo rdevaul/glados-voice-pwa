@@ -80,17 +80,18 @@ function App() {
   const isReconnecting = stream.status === 'reconnecting';
   const isStreamProcessing = stream.status === 'processing';
 
+  // Track if we've initiated connection to avoid loops
+  const connectionInitiated = useRef(false);
+  
   // Connect to WebSocket on mount if streaming enabled
   useEffect(() => {
-    if (useStreaming && stream.status === 'disconnected') {
+    if (useStreaming && !connectionInitiated.current) {
+      connectionInitiated.current = true;
+      console.log('Initiating WebSocket connection...');
       stream.connect();
     }
-    return () => {
-      if (useStreaming) {
-        stream.disconnect();
-      }
-    };
-  }, [useStreaming]);
+    // No cleanup - let the hook handle its own WebSocket lifecycle
+  }, [useStreaming, stream.connect]);
 
   // Save messages whenever they change
   useEffect(() => {

@@ -87,18 +87,19 @@ export function useVoiceStream(wsUrl: string): UseVoiceStreamReturn {
     if (wsRef.current?.readyState === WebSocket.OPEN) return;
     
     shouldReconnectRef.current = true;
-    
-    // Check for existing session to restore
-    const savedSessionId = getSavedSessionId();
-    if (savedSessionId && !isReconnectingRef.current) {
-      isReconnectingRef.current = true;
-      setStatus('reconnecting');
-    } else {
-      setStatus('connecting');
-    }
+    setStatus('connecting');
     setError(null);
 
-    const connectUrl = buildWsUrl(savedSessionId);
+    // TEMPORARILY DISABLED: session restoration
+    // const savedSessionId = getSavedSessionId();
+    // if (savedSessionId && !isReconnectingRef.current) {
+    //   isReconnectingRef.current = true;
+    //   setStatus('reconnecting');
+    // }
+    // const connectUrl = buildWsUrl(savedSessionId);
+    
+    // Connect without session ID for now
+    const connectUrl = wsUrl;
     console.log('Connecting to:', connectUrl);
     
     const ws = new WebSocket(connectUrl);
