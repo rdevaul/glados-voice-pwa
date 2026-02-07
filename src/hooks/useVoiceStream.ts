@@ -118,6 +118,7 @@ export function useVoiceStream(wsUrl: string): UseVoiceStreamReturn {
             setSessionId(data.session_id);
             sessionIdRef.current = data.session_id;
             setStatus('ready');
+            setError(null);  // Clear any previous connection errors
             isReconnectingRef.current = false;
             // Save initial session state
             saveSessionState({
@@ -132,6 +133,7 @@ export function useVoiceStream(wsUrl: string): UseVoiceStreamReturn {
             setSessionId(data.session_id);
             sessionIdRef.current = data.session_id;
             setStatus(data.state === 'processing' ? 'processing' : 'ready');
+            setError(null);  // Clear any previous connection errors
             isReconnectingRef.current = false;
             
             // Restore partial state
