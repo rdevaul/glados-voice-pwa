@@ -76,7 +76,8 @@ function App() {
   // Determine which mode we're using
   const isRecording = useStreaming ? stream.status === 'recording' : batchIsRecording;
   const error = useStreaming ? stream.error : batchError;
-  const isConnected = stream.status !== 'disconnected';
+  const isConnected = stream.status !== 'disconnected' && stream.status !== 'reconnecting';
+  const isReconnecting = stream.status === 'reconnecting';
   const isStreamProcessing = stream.status === 'processing';
 
   // Connect to WebSocket on mount if streaming enabled
@@ -398,6 +399,7 @@ function App() {
     switch (stream.status) {
       case 'disconnected': return '🔴';
       case 'connecting': return '🟡';
+      case 'reconnecting': return '🟠'; // Reconnecting after app switch
       case 'ready': return '🟢';
       case 'recording': return '🔴';
       case 'processing': return '🔵';
@@ -430,6 +432,8 @@ function App() {
           <div className="empty-state">
             {!useStreaming ? (
               <>Batch mode. Tap status icon to switch to streaming.</>
+            ) : isReconnecting ? (
+              <>🔄 Reconnecting...</>
             ) : !isConnected ? (
               <>Connecting to voice server...</>
             ) : micPermission === 'prompt' ? (
