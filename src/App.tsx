@@ -140,24 +140,38 @@ function App() {
     
     const msgId = currentAssistantMsgRef.current;
     
-    if (stream.responseText && msgId) {
-      // Update assistant message with streaming text
+    if (stream.responseText) {
       const latestAudioUrl = stream.audioQueue.length > 0 
         ? getAudioUrl(stream.audioQueue[stream.audioQueue.length - 1])
         : undefined;
-        
-      setMessages(prev => prev.map(m => 
-        m.id === msgId
-          ? { 
-              ...m, 
-              text: stream.responseText, 
-              streaming: !stream.responseComplete,
-              audioUrl: stream.responseComplete ? latestAudioUrl : m.audioUrl
-            }
-          : m
-      ));
       
-      // Only clear the ref AFTER updating the message with final state
+      if (msgId) {
+        // Update existing assistant message with streaming text
+        setMessages(prev => prev.map(m => 
+          m.id === msgId
+            ? { 
+                ...m, 
+                text: stream.responseText, 
+                streaming: !stream.responseComplete,
+                audioUrl: stream.responseComplete ? latestAudioUrl : m.audioUrl
+              }
+            : m
+        ));
+      } else if (stream.responseComplete) {
+        // No existing message (e.g., restored session) - create a new one
+        const newId = `${Date.now()}-${Math.random()}`;
+        setMessages(prev => [...prev, {
+          id: newId,
+          role: 'assistant',
+          text: stream.responseText,
+          audioUrl: latestAudioUrl,
+          timestamp: Date.now(),
+          pending: false,
+          streaming: false,
+        }]);
+      }
+      
+      // Clear state when complete
       if (stream.responseComplete) {
         setIsProcessing(false);
         currentAssistantMsgRef.current = null;
