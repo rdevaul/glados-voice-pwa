@@ -7,6 +7,23 @@
 const STORAGE_KEY = 'glados-voice-session';
 const DEFAULT_MAX_AGE_MS = 3600000; // 1 hour
 
+// DEBUG: Clear stale sessions from before the session persistence update
+// Remove this after confirming the fix works
+try {
+  const stored = localStorage.getItem(STORAGE_KEY);
+  if (stored) {
+    const parsed = JSON.parse(stored);
+    // If missing expected fields, clear it
+    if (!parsed.sessionId || !parsed.lastActivity) {
+      console.log('Clearing malformed session data');
+      localStorage.removeItem(STORAGE_KEY);
+    }
+  }
+} catch (e) {
+  console.log('Clearing corrupted session data');
+  localStorage.removeItem(STORAGE_KEY);
+}
+
 export interface PersistedSession {
   /** Server-assigned session ID */
   sessionId: string;
