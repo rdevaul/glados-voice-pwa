@@ -6,7 +6,7 @@
 import { useState, useEffect, useCallback, useRef } from 'react';
 import { 
   saveSessionState,
-  getSavedSessionId,
+  // getSavedSessionId,  // Temporarily disabled
 } from '../utils/sessionPersistence';
 import type { PersistedSession } from '../utils/sessionPersistence';
 
