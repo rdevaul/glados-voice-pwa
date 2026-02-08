@@ -17,7 +17,7 @@ from pydantic import BaseModel, Field
 from starlette.websockets import WebSocketState
 
 from .transcribe import ChunkedTranscriber
-from .stream_response import stream_chat_response
+from .stream_response import stream_chat_response, get_all_responses
 from .main import strip_markdown
 from .session_store import session_store, start_cleanup_task, Session
 
@@ -408,10 +408,14 @@ class WebSocketManager:
         await session_store.update_session(session_id, audio_buffer=b'')
 
     async def _process_text(self, session_id: str, text: str):
-        """Process text input and generate response via OpenClaw."""
-        logger.info(f"Processing text: {text[:50]}...")
+        """Process text input and generate response via OpenClaw.
         
-        accumulated = ""
+        Supports multi-message responses: first message sent as response_complete,
+        additional messages sent as server_message events with their own TTS.
+        """
+        import uuid
+        
+        logger.info(f"Processing text: {text[:50]}...")
         
         try:
             # Update state to processing
@@ -421,43 +425,52 @@ class WebSocketManager:
             # This routes to the main session for unified context
             voice_text = f"[Voice PWA] {text}"
             
-            # Stream response chunks from OpenClaw (uses main session by default)
-            async for chunk in stream_chat_response(voice_text):
-                accumulated += (" " if accumulated else "") + chunk
+            # Get all response payloads from OpenClaw
+            payloads = await get_all_responses(voice_text)
+            
+            logger.info(f"Received {len(payloads)} payload(s) from OpenClaw")
+            
+            for i, payload in enumerate(payloads):
+                response_text = payload.get("text", "")
+                if not response_text:
+                    continue
                 
-                # Store partial response for reconnection recovery
-                await session_store.update_session(session_id, partial_response=accumulated)
+                # Generate TTS for this message
+                audio_url = await self._generate_tts(response_text)
+                logger.info(f"Generated TTS for message {i+1}/{len(payloads)}: {audio_url}")
                 
-                # Try to send, but if disconnected, message will be queued
-                sent = await self.send_message(
-                    ResponseChunkMessage(text=chunk, accumulated=accumulated),
-                    session_id
-                )
+                if i == 0:
+                    # First message: send as response_complete
+                    response_complete = ResponseCompleteMessage(
+                        text=response_text,
+                        audio_url=audio_url
+                    )
+                    
+                    sent = await self.send_message(response_complete, session_id)
+                    
+                    if not sent:
+                        await session_store.queue_message(session_id, response_complete.dict())
+                    
+                    logger.info(f"Sent response_complete with audio_url: {audio_url}")
+                else:
+                    # Additional messages: send as server_message
+                    server_msg = ServerMessage(
+                        message_id=str(uuid.uuid4()),
+                        text=response_text,
+                        audio_url=audio_url,
+                        reason="continuation"
+                    )
+                    
+                    sent = await self.send_message(server_msg, session_id)
+                    
+                    if not sent:
+                        await session_store.queue_message(session_id, server_msg.dict())
+                    
+                    logger.info(f"Sent server_message {i+1}/{len(payloads)} with audio_url: {audio_url}")
                 
-                if not sent:
-                    # Client disconnected, queue the message
-                    await session_store.queue_message(session_id, {
-                        'type': 'response_chunk',
-                        'text': chunk,
-                        'accumulated': accumulated
-                    })
-            
-            # Generate TTS for the response
-            audio_url = await self._generate_tts(accumulated)
-            logger.info(f"Generated TTS audio_url: {audio_url}")
-            
-            response_complete = ResponseCompleteMessage(
-                text=accumulated,
-                audio_url=audio_url
-            )
-            
-            sent = await self.send_message(response_complete, session_id)
-            
-            if not sent:
-                # Queue for delivery on reconnect
-                await session_store.queue_message(session_id, response_complete.dict())
-            
-            logger.info(f"Sent response_complete with audio_url: {audio_url}")
+                # Small delay between messages for better UX
+                if i < len(payloads) - 1:
+                    await asyncio.sleep(0.2)
             
             # Reset state
             await session_store.update_session(

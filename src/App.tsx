@@ -179,6 +179,37 @@ function App() {
     }
   }, [stream.responseText, stream.responseComplete, stream.audioQueue, useStreaming]);
 
+  // Handle server messages (additional messages from agent)
+  const lastServerMsgCountRef = useRef(0);
+  
+  useEffect(() => {
+    if (!useStreaming) return;
+    
+    // Only process new server messages
+    const newMessages = stream.serverMessages.slice(lastServerMsgCountRef.current);
+    lastServerMsgCountRef.current = stream.serverMessages.length;
+    
+    if (newMessages.length === 0) return;
+    
+    // Add each new server message as an assistant message
+    newMessages.forEach(serverMsg => {
+      const audioUrl = serverMsg.audio_url ? getAudioUrl(serverMsg.audio_url) : undefined;
+      
+      setMessages(prev => [...prev, {
+        id: serverMsg.message_id,
+        role: 'assistant',
+        text: serverMsg.text,
+        audioUrl,
+        timestamp: Date.now(),
+        pending: false,
+        streaming: false,
+      }]);
+      
+      console.log('Added server message:', serverMsg.message_id, serverMsg.reason);
+    });
+    
+  }, [stream.serverMessages, useStreaming]);
+
   // Handle audio queue for streaming responses
   const lastAudioIndexRef = useRef(0);
   const lastAudioQueueLengthRef = useRef(0);

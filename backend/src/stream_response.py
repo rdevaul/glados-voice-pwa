@@ -153,3 +153,94 @@ async def get_full_response(user_text: str, session_id: str | None = None) -> st
     async for chunk in stream_chat_response(user_text, session_id):
         chunks.append(chunk)
     return " ".join(chunks)
+
+
+async def get_all_responses(user_text: str, session_id: str | None = None) -> list[dict]:
+    """
+    Get all response payloads from OpenClaw.
+    
+    Returns a list of payload dicts, each with 'text' and optionally 'mediaUrl'.
+    This supports multi-message responses where the agent sends multiple replies.
+    
+    Args:
+        user_text: The user's message
+        session_id: OpenClaw session ID (defaults to main session)
+        
+    Returns:
+        List of payload dicts: [{"text": "...", "mediaUrl": None}, ...]
+    """
+    if not user_text or not user_text.strip():
+        return [{"text": "I didn't catch that. Could you please repeat?", "mediaUrl": None}]
+    
+    # Resolve session ID to the main session's UUID if not provided
+    if session_id is None:
+        session_id = get_main_session_id()
+    
+    logger.info(f"Sending to OpenClaw (session {session_id[:20]}...): {user_text[:50]}...")
+    
+    try:
+        # Run OpenClaw CLI
+        cmd = [
+            "openclaw", "agent",
+            "--message", user_text,
+            "--session-id", session_id,
+            "--json",
+            "--timeout", "120"
+        ]
+        
+        process = await asyncio.create_subprocess_exec(
+            *cmd,
+            stdout=asyncio.subprocess.PIPE,
+            stderr=asyncio.subprocess.PIPE
+        )
+        
+        stdout, stderr = await asyncio.wait_for(
+            process.communicate(),
+            timeout=130
+        )
+        
+        if process.returncode == 0:
+            try:
+                response_data = json.loads(stdout.decode())
+                payloads = response_data.get("result", {}).get("payloads", [])
+                
+                if payloads:
+                    # Return all payloads that have text
+                    results = []
+                    for i, payload in enumerate(payloads):
+                        text = payload.get("text")
+                        if text:
+                            logger.info(f"OpenClaw payload {i+1}/{len(payloads)}: {text[:100]}...")
+                            results.append({
+                                "text": text,
+                                "mediaUrl": payload.get("mediaUrl")
+                            })
+                    
+                    if results:
+                        return results
+                    
+                logger.warning(f"No text payloads in response: {list(response_data.keys())}")
+                return [{"text": "I processed your message but got an unexpected response format.", "mediaUrl": None}]
+                    
+            except json.JSONDecodeError as e:
+                logger.error(f"JSON decode error: {e}")
+                raw = stdout.decode().strip()
+                if raw:
+                    return [{"text": raw, "mediaUrl": None}]
+                return [{"text": "I received your message.", "mediaUrl": None}]
+        else:
+            error_msg = stderr.decode()[:200] if stderr else "Unknown error"
+            logger.error(f"OpenClaw error: {error_msg}")
+            return [{"text": "Sorry, I encountered an error processing your request.", "mediaUrl": None}]
+            
+    except asyncio.TimeoutError:
+        logger.error("OpenClaw timeout")
+        return [{"text": "Sorry, the response took too long. Please try again.", "mediaUrl": None}]
+        
+    except FileNotFoundError:
+        logger.error("OpenClaw CLI not found")
+        return [{"text": "The chat service is not available right now.", "mediaUrl": None}]
+        
+    except Exception as e:
+        logger.exception(f"Error in get_all_responses: {e}")
+        return [{"text": f"Sorry, something went wrong: {str(e)}", "mediaUrl": None}]
