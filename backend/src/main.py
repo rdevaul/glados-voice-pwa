@@ -132,9 +132,10 @@ async def speak(request: SpeakRequest):
     audio_id = uuid.uuid4().hex
     output_file_path = AUDIO_CACHE_DIR / f"{audio_id}.wav"
     
-    # Strip markdown and escape quotes for shell
+    # Strip markdown and escape for shell (double-quoted context)
     clean_text = strip_markdown(request.text)
-    safe_text = clean_text.replace('"', '\\"').replace("'", "'\\''")
+    # In double quotes, only need to escape: backslashes, double quotes, backticks, and $
+    safe_text = clean_text.replace('\\', '\\\\').replace('"', '\\"').replace('`', '\\`').replace('$', '\\$')
     
     piper_command = PIPER_CMD.format(
         text=safe_text,
@@ -272,7 +273,8 @@ async def _process_chat(user_text: str):
     output_file_path = AUDIO_CACHE_DIR / f"{audio_id}.wav"
     
     clean_text = strip_markdown(response_text)
-    safe_text = clean_text.replace('"', '\\"').replace("'", "'\\''")
+    # In double quotes, only need to escape: backslashes, double quotes, backticks, and $
+    safe_text = clean_text.replace('\\', '\\\\').replace('"', '\\"').replace('`', '\\`').replace('$', '\\$')
     piper_command = PIPER_CMD.format(
         text=safe_text,
         output_file=output_file_path

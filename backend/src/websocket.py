@@ -536,9 +536,10 @@ class WebSocketManager:
         output_dir.mkdir(exist_ok=True)
         output_file = output_dir / f"{audio_id}.wav"
         
-        # Strip markdown and escape text for shell
+        # Strip markdown and escape text for shell (double-quoted context)
         clean_text = strip_markdown(text)
-        safe_text = clean_text.replace('"', '\\"').replace("'", "'\\''")
+        # In double quotes, only need to escape: double quotes, backticks, backslashes, and $
+        safe_text = clean_text.replace('\\', '\\\\').replace('"', '\\"').replace('`', '\\`').replace('$', '\\$')
         
         # Piper TTS command
         piper_cmd = f'eval "$(pyenv init -)" && echo "{safe_text}" | piper -m /Users/rich/Projects/piper-models/en_US-lessac-medium.onnx -f {output_file}'
