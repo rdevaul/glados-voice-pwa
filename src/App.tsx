@@ -146,7 +146,7 @@ function App() {
         m.id === msgId
           ? { 
               ...m, 
-              text: `⏳ ${stream.processingStatus.message}`,
+              text: `⏳ ${stream.processingStatus?.message ?? 'Processing...'}`,
               streaming: true,
             }
           : m

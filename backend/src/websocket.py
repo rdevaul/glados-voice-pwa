@@ -57,6 +57,14 @@ class AckMessage(BaseModel):
     message_id: str
 
 
+class PingMessage(BaseModel):
+    type: str = "ping"
+
+
+class PongMessage(BaseModel):
+    type: str = "pong"
+
+
 # =============================================================================
 # Message Types (Server → Client)
 # =============================================================================
@@ -288,6 +296,12 @@ class WebSocketManager:
                 # Client acknowledges receipt of a message
                 ack_msg = AckMessage(**data)
                 logger.debug(f"Ack received for message: {ack_msg.message_id}")
+                return
+                
+            elif msg_type == "ping":
+                # Client checking if connection is alive (mobile visibility change)
+                await self.send_message(PongMessage(), session_id)
+                logger.debug(f"Pong sent to {session_id}")
                 return
                 
             elif msg_type == "audio_start":

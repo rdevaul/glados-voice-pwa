@@ -16,7 +16,7 @@ export function PushToTalkButton({
 }: Props) {
   const isRecordingRef = useRef(false);
 
-  const handleStart = useCallback((e: React.PointerEvent | React.TouchEvent) => {
+  const handleStart = useCallback((e: React.MouseEvent | React.TouchEvent) => {
     if (disabled) return;
     e.preventDefault();
     if (!isRecordingRef.current) {
@@ -24,13 +24,6 @@ export function PushToTalkButton({
       onStartRecording();
     }
   }, [disabled, onStartRecording]);
-
-  const handleEnd = useCallback(() => {
-    if (isRecordingRef.current) {
-      isRecordingRef.current = false;
-      onStopRecording();
-    }
-  }, [onStopRecording]);
 
   // Use document-level listeners to catch mouseup/touchend anywhere on screen
   // This fixes the bug where moving mouse outside button would stop recording

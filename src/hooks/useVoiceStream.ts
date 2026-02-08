@@ -64,6 +64,8 @@ export function useVoiceStream(wsUrl: string): UseVoiceStreamReturn {
   const shouldReconnectRef = useRef(true);
   const sessionIdRef = useRef<string | null>(null);
   const isReconnectingRef = useRef(false);
+  const pongReceivedRef = useRef(false);
+  const pingTimeoutRef = useRef<ReturnType<typeof setTimeout> | null>(null);
 
   // Save session state for persistence
   const saveState = useCallback(() => {
@@ -121,6 +123,16 @@ export function useVoiceStream(wsUrl: string): UseVoiceStreamReturn {
         const data = JSON.parse(event.data);
         
         switch (data.type) {
+          case 'pong':
+            // Connection verified after visibility change
+            console.log('Pong received, connection verified');
+            pongReceivedRef.current = true;
+            if (pingTimeoutRef.current) {
+              clearTimeout(pingTimeoutRef.current);
+              pingTimeoutRef.current = null;
+            }
+            break;
+            
           case 'ready':
             setSessionId(data.session_id);
             sessionIdRef.current = data.session_id;
@@ -421,27 +433,71 @@ export function useVoiceStream(wsUrl: string): UseVoiceStreamReturn {
   }, []);
 
   // Handle visibility changes (app switch on mobile)
+  // Mobile browsers often keep WebSocket "OPEN" even when connection is dead
   useEffect(() => {
     const handleVisibilityChange = () => {
       if (document.hidden) {
         // App going to background - save state
         console.log('App hidden, saving session state');
         saveState();
+        
+        // Clear any pending ping timeout
+        if (pingTimeoutRef.current) {
+          clearTimeout(pingTimeoutRef.current);
+          pingTimeoutRef.current = null;
+        }
       } else {
-        // App returning to foreground
-        console.log('App visible, checking connection');
-        if (wsRef.current?.readyState !== WebSocket.OPEN && shouldReconnectRef.current) {
-          // Connection lost while in background, reconnect
-          console.log('Connection lost, reconnecting...');
+        // App returning to foreground - always verify connection is alive
+        console.log('App visible, verifying connection...');
+        
+        if (!shouldReconnectRef.current) return;
+        
+        if (!wsRef.current || wsRef.current.readyState !== WebSocket.OPEN) {
+          // Connection obviously dead, reconnect immediately
+          console.log('Connection closed, reconnecting...');
           setStatus('reconnecting');
           connect();
+          return;
         }
+        
+        // Connection appears open - send ping to verify it's alive
+        // Mobile browsers often show OPEN for stale connections
+        pongReceivedRef.current = false;
+        
+        try {
+          wsRef.current.send(JSON.stringify({ type: 'ping' }));
+          console.log('Sent ping to verify connection');
+        } catch (e) {
+          // Send failed, connection is dead
+          console.log('Ping send failed, reconnecting...');
+          setStatus('reconnecting');
+          connect();
+          return;
+        }
+        
+        // Wait for pong - if no response in 3s, force reconnect
+        pingTimeoutRef.current = setTimeout(() => {
+          if (!pongReceivedRef.current && shouldReconnectRef.current) {
+            console.log('No pong received, connection stale - reconnecting...');
+            // Force close the stale connection
+            if (wsRef.current) {
+              wsRef.current.close();
+              wsRef.current = null;
+            }
+            setStatus('reconnecting');
+            connect();
+          }
+        }, 3000);
       }
     };
 
     document.addEventListener('visibilitychange', handleVisibilityChange);
+    
     return () => {
       document.removeEventListener('visibilitychange', handleVisibilityChange);
+      if (pingTimeoutRef.current) {
+        clearTimeout(pingTimeoutRef.current);
+      }
     };
   }, [saveState, connect]);
 
