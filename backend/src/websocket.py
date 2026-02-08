@@ -17,7 +17,7 @@ from pydantic import BaseModel, Field
 from starlette.websockets import WebSocketState
 
 from .transcribe import ChunkedTranscriber
-from .stream_response import stream_chat_response, get_all_responses
+from .stream_response import stream_chat_response, get_all_responses, get_all_responses_with_progress
 from .main import strip_markdown
 from .session_store import session_store, start_cleanup_task, Session
 
@@ -111,6 +111,13 @@ class ServerMessage(BaseModel):
     text: str
     audio_url: Optional[str] = None
     reason: str = "follow_up"  # follow_up, correction, proactive, continuation
+
+
+class ProcessingStatusMessage(BaseModel):
+    """Progress update while processing a long request."""
+    type: str = "processing_status"
+    message: str
+    elapsed_seconds: int
 
 
 # =============================================================================
@@ -412,6 +419,8 @@ class WebSocketManager:
         
         Supports multi-message responses: first message sent as response_complete,
         additional messages sent as server_message events with their own TTS.
+        
+        Sends progress updates every 10s for long-running requests.
         """
         import uuid
         
@@ -425,8 +434,22 @@ class WebSocketManager:
             # This routes to the main session for unified context
             voice_text = f"[Voice PWA] {text}"
             
-            # Get all response payloads from OpenClaw
-            payloads = await get_all_responses(voice_text)
+            # Progress callback for long-running requests
+            async def on_progress(message: str, elapsed: int):
+                status_msg = ProcessingStatusMessage(
+                    message=message,
+                    elapsed_seconds=elapsed
+                )
+                await self.send_message(status_msg, session_id)
+                logger.info(f"Sent progress update to {session_id}: {message} ({elapsed}s)")
+            
+            # Get all response payloads from OpenClaw with progress updates
+            payloads = await get_all_responses_with_progress(
+                voice_text,
+                progress_callback=on_progress,
+                progress_interval=10,
+                max_timeout=300
+            )
             
             logger.info(f"Received {len(payloads)} payload(s) from OpenClaw")
             

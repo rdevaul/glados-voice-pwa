@@ -17,6 +17,11 @@ export interface ServerMessage {
   reason: 'follow_up' | 'correction' | 'proactive' | 'continuation';
 }
 
+export interface ProcessingStatus {
+  message: string;
+  elapsedSeconds: number;
+}
+
 export interface UseVoiceStreamReturn {
   status: 'disconnected' | 'connecting' | 'ready' | 'recording' | 'processing' | 'reconnecting';
   sessionId: string | null;
@@ -26,6 +31,7 @@ export interface UseVoiceStreamReturn {
   responseComplete: boolean;
   audioQueue: string[];
   serverMessages: ServerMessage[];
+  processingStatus: ProcessingStatus | null;
   error: string | null;
   connect: () => void;
   disconnect: () => void;
@@ -48,6 +54,7 @@ export function useVoiceStream(wsUrl: string): UseVoiceStreamReturn {
   const [responseComplete, setResponseComplete] = useState(false);
   const [audioQueue, setAudioQueue] = useState<string[]>([]);
   const [serverMessages, setServerMessages] = useState<ServerMessage[]>([]);
+  const [processingStatus, setProcessingStatus] = useState<ProcessingStatus | null>(null);
   const [error, setError] = useState<string | null>(null);
 
   const wsRef = useRef<WebSocket | null>(null);
@@ -170,10 +177,19 @@ export function useVoiceStream(wsUrl: string): UseVoiceStreamReturn {
           case 'response_complete':
             setResponseText(data.text);
             setResponseComplete(true);
+            setProcessingStatus(null);  // Clear processing status on completion
             if (data.audio_url) {
               setAudioQueue(prev => [...prev, data.audio_url]);
             }
             setStatus('ready');
+            break;
+            
+          case 'processing_status':
+            // Progress update for long-running requests
+            setProcessingStatus({
+              message: data.message,
+              elapsedSeconds: data.elapsed_seconds,
+            });
             break;
             
           case 'server_message':
@@ -324,6 +340,7 @@ export function useVoiceStream(wsUrl: string): UseVoiceStreamReturn {
       setResponseComplete(false);
       setPartialTranscript('');
       setFinalTranscript('');
+      setProcessingStatus(null);
 
     } catch (err) {
       const message = err instanceof Error ? err.message : 'Failed to start recording';
@@ -368,6 +385,7 @@ export function useVoiceStream(wsUrl: string): UseVoiceStreamReturn {
     // Clear previous response
     setResponseText('');
     setResponseComplete(false);
+    setProcessingStatus(null);
   }, [status]);
 
   const cancel = useCallback(() => {
@@ -388,6 +406,7 @@ export function useVoiceStream(wsUrl: string): UseVoiceStreamReturn {
     setFinalTranscript('');
     setResponseText('');
     setResponseComplete(false);
+    setProcessingStatus(null);
     setStatus('ready');
   }, []);
 
@@ -454,6 +473,7 @@ export function useVoiceStream(wsUrl: string): UseVoiceStreamReturn {
     responseComplete,
     audioQueue,
     serverMessages,
+    processingStatus,
     error,
     connect,
     disconnect,

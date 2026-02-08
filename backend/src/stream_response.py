@@ -8,9 +8,18 @@ import logging
 import os
 import subprocess
 from pathlib import Path
-from typing import AsyncIterator, Optional
+from typing import AsyncIterator, Optional, Callable, Awaitable
 
 logger = logging.getLogger(__name__)
+
+# Progress messages shown while waiting for long responses
+PROGRESS_MESSAGES = [
+    "Working on that...",
+    "Still processing...",
+    "This is taking a moment, but I'm on it...",
+    "Hang tight, almost there...",
+    "Still working on your request...",
+]
 
 # OpenClaw session store location
 OPENCLAW_SESSIONS_FILE = Path.home() / ".openclaw" / "agents" / "main" / "sessions" / "sessions.json"
@@ -243,4 +252,140 @@ async def get_all_responses(user_text: str, session_id: str | None = None) -> li
         
     except Exception as e:
         logger.exception(f"Error in get_all_responses: {e}")
+        return [{"text": f"Sorry, something went wrong: {str(e)}", "mediaUrl": None}]
+
+
+async def get_all_responses_with_progress(
+    user_text: str,
+    session_id: str | None = None,
+    progress_callback: Callable[[str, int], Awaitable[None]] | None = None,
+    progress_interval: int = 10,
+    max_timeout: int = 300,
+) -> list[dict]:
+    """
+    Get all response payloads from OpenClaw with progress updates.
+    
+    Sends progress updates via callback while waiting for long responses.
+    This prevents client timeouts and provides user feedback.
+    
+    Args:
+        user_text: The user's message
+        session_id: OpenClaw session ID (defaults to main session)
+        progress_callback: Async function called with (message, elapsed_seconds)
+        progress_interval: Seconds between progress updates (default 10)
+        max_timeout: Maximum time to wait for response (default 300s)
+        
+    Returns:
+        List of payload dicts: [{"text": "...", "mediaUrl": None}, ...]
+    """
+    if not user_text or not user_text.strip():
+        return [{"text": "I didn't catch that. Could you please repeat?", "mediaUrl": None}]
+    
+    # Resolve session ID to the main session's UUID if not provided
+    if session_id is None:
+        session_id = get_main_session_id()
+    
+    logger.info(f"Sending to OpenClaw with progress (session {session_id[:20]}...): {user_text[:50]}...")
+    
+    # Progress heartbeat task
+    progress_task: Optional[asyncio.Task] = None
+    
+    async def send_progress():
+        """Send periodic progress updates."""
+        elapsed = 0
+        try:
+            while True:
+                await asyncio.sleep(progress_interval)
+                elapsed += progress_interval
+                if progress_callback:
+                    # Cycle through progress messages
+                    msg_idx = (elapsed // progress_interval - 1) % len(PROGRESS_MESSAGES)
+                    msg = PROGRESS_MESSAGES[msg_idx]
+                    try:
+                        await progress_callback(msg, elapsed)
+                        logger.debug(f"Sent progress update: {msg} ({elapsed}s)")
+                    except Exception as e:
+                        logger.warning(f"Progress callback failed: {e}")
+        except asyncio.CancelledError:
+            logger.debug(f"Progress task cancelled after {elapsed}s")
+            raise
+    
+    try:
+        # Run OpenClaw CLI
+        cmd = [
+            "openclaw", "agent",
+            "--message", user_text,
+            "--session-id", session_id,
+            "--json",
+            "--timeout", str(max_timeout - 10)  # Leave buffer for subprocess timeout
+        ]
+        
+        process = await asyncio.create_subprocess_exec(
+            *cmd,
+            stdout=asyncio.subprocess.PIPE,
+            stderr=asyncio.subprocess.PIPE
+        )
+        
+        # Start progress heartbeat
+        if progress_callback:
+            progress_task = asyncio.create_task(send_progress())
+        
+        try:
+            stdout, stderr = await asyncio.wait_for(
+                process.communicate(),
+                timeout=max_timeout
+            )
+        finally:
+            # Always cancel progress task when done
+            if progress_task:
+                progress_task.cancel()
+                try:
+                    await progress_task
+                except asyncio.CancelledError:
+                    pass
+        
+        if process.returncode == 0:
+            try:
+                response_data = json.loads(stdout.decode())
+                payloads = response_data.get("result", {}).get("payloads", [])
+                
+                if payloads:
+                    # Return all payloads that have text
+                    results = []
+                    for i, payload in enumerate(payloads):
+                        text = payload.get("text")
+                        if text:
+                            logger.info(f"OpenClaw payload {i+1}/{len(payloads)}: {text[:100]}...")
+                            results.append({
+                                "text": text,
+                                "mediaUrl": payload.get("mediaUrl")
+                            })
+                    
+                    if results:
+                        return results
+                    
+                logger.warning(f"No text payloads in response: {list(response_data.keys())}")
+                return [{"text": "I processed your message but got an unexpected response format.", "mediaUrl": None}]
+                    
+            except json.JSONDecodeError as e:
+                logger.error(f"JSON decode error: {e}")
+                raw = stdout.decode().strip()
+                if raw:
+                    return [{"text": raw, "mediaUrl": None}]
+                return [{"text": "I received your message.", "mediaUrl": None}]
+        else:
+            error_msg = stderr.decode()[:200] if stderr else "Unknown error"
+            logger.error(f"OpenClaw error: {error_msg}")
+            return [{"text": "Sorry, I encountered an error processing your request.", "mediaUrl": None}]
+            
+    except asyncio.TimeoutError:
+        logger.error(f"OpenClaw timeout after {max_timeout}s")
+        return [{"text": f"Sorry, the response took too long (>{max_timeout}s). Please try again with a simpler request.", "mediaUrl": None}]
+        
+    except FileNotFoundError:
+        logger.error("OpenClaw CLI not found")
+        return [{"text": "The chat service is not available right now.", "mediaUrl": None}]
+        
+    except Exception as e:
+        logger.exception(f"Error in get_all_responses_with_progress: {e}")
         return [{"text": f"Sorry, something went wrong: {str(e)}", "mediaUrl": None}]

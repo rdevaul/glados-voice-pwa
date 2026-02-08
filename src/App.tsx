@@ -134,11 +134,24 @@ function App() {
     }
   }, [stream.partialTranscript, stream.finalTranscript, useStreaming]);
 
-  // Handle streaming response updates
+  // Handle streaming response updates (including processing status)
   useEffect(() => {
     if (!useStreaming) return;
     
     const msgId = currentAssistantMsgRef.current;
+    
+    // Show processing status while waiting for response
+    if (stream.processingStatus && msgId && !stream.responseText) {
+      setMessages(prev => prev.map(m => 
+        m.id === msgId
+          ? { 
+              ...m, 
+              text: `⏳ ${stream.processingStatus.message}`,
+              streaming: true,
+            }
+          : m
+      ));
+    }
     
     if (stream.responseText) {
       const latestAudioUrl = stream.audioQueue.length > 0 
@@ -177,7 +190,7 @@ function App() {
         currentAssistantMsgRef.current = null;
       }
     }
-  }, [stream.responseText, stream.responseComplete, stream.audioQueue, useStreaming]);
+  }, [stream.responseText, stream.responseComplete, stream.audioQueue, stream.processingStatus, useStreaming]);
 
   // Handle server messages (additional messages from agent)
   const lastServerMsgCountRef = useRef(0);
