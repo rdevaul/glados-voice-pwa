@@ -1,4 +1,4 @@
-import { useCallback, useRef } from 'react';
+import { useCallback, useRef, useEffect } from 'react';
 import './PushToTalkButton.css';
 
 interface Props {
@@ -14,29 +14,48 @@ export function PushToTalkButton({
   onStopRecording,
   disabled = false,
 }: Props) {
-  const wasRecordingRef = useRef(false);
+  const isRecordingRef = useRef(false);
 
-  const handleStart = useCallback(() => {
+  const handleStart = useCallback((e: React.PointerEvent | React.TouchEvent) => {
     if (disabled) return;
-    wasRecordingRef.current = true;
-    onStartRecording();
+    e.preventDefault();
+    if (!isRecordingRef.current) {
+      isRecordingRef.current = true;
+      onStartRecording();
+    }
   }, [disabled, onStartRecording]);
 
   const handleEnd = useCallback(() => {
-    if (wasRecordingRef.current) {
-      wasRecordingRef.current = false;
+    if (isRecordingRef.current) {
+      isRecordingRef.current = false;
       onStopRecording();
     }
+  }, [onStopRecording]);
+
+  // Use document-level listeners to catch mouseup/touchend anywhere on screen
+  // This fixes the bug where moving mouse outside button would stop recording
+  useEffect(() => {
+    const handleGlobalEnd = () => {
+      if (isRecordingRef.current) {
+        isRecordingRef.current = false;
+        onStopRecording();
+      }
+    };
+
+    document.addEventListener('mouseup', handleGlobalEnd);
+    document.addEventListener('touchend', handleGlobalEnd);
+
+    return () => {
+      document.removeEventListener('mouseup', handleGlobalEnd);
+      document.removeEventListener('touchend', handleGlobalEnd);
+    };
   }, [onStopRecording]);
 
   return (
     <button
       className={`ptt-button ${isRecording ? 'recording' : ''} ${disabled ? 'disabled' : ''}`}
       onMouseDown={handleStart}
-      onMouseUp={handleEnd}
-      onMouseLeave={handleEnd}
       onTouchStart={handleStart}
-      onTouchEnd={handleEnd}
       disabled={disabled}
     >
       <div className="ptt-icon">🎤</div>
