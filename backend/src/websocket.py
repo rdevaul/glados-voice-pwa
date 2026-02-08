@@ -417,8 +417,12 @@ class WebSocketManager:
             # Update state to processing
             await session_store.update_session(session_id, state='processing', partial_response='')
             
-            # Stream response chunks from OpenClaw
-            async for chunk in stream_chat_response(text, session_id="voice"):
+            # Add voice prefix so the agent knows input is spoken
+            # This routes to the main session for unified context
+            voice_text = f"[Voice PWA] {text}"
+            
+            # Stream response chunks from OpenClaw (uses main session by default)
+            async for chunk in stream_chat_response(voice_text):
                 accumulated += (" " if accumulated else "") + chunk
                 
                 # Store partial response for reconnection recovery

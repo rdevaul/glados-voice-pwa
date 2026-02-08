@@ -13,7 +13,7 @@ logger = logging.getLogger(__name__)
 
 async def stream_chat_response(
     user_text: str,
-    session_id: str = "voice"
+    session_id: str = "agent:main:main"
 ) -> AsyncIterator[str]:
     """
     Stream response chunks from OpenClaw.
@@ -113,7 +113,7 @@ def _split_sentences(text: str) -> list[str]:
     return [s.strip() for s in sentences if s.strip()]
 
 
-async def get_full_response(user_text: str, session_id: str = "voice") -> str:
+async def get_full_response(user_text: str, session_id: str = "agent:main:main") -> str:
     """Get complete response (non-streaming convenience function)."""
     chunks = []
     async for chunk in stream_chat_response(user_text, session_id):
