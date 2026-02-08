@@ -5,15 +5,45 @@ Stream chat responses from OpenClaw CLI.
 import asyncio
 import json
 import logging
+import os
 import subprocess
+from pathlib import Path
 from typing import AsyncIterator, Optional
 
 logger = logging.getLogger(__name__)
 
+# OpenClaw session store location
+OPENCLAW_SESSIONS_FILE = Path.home() / ".openclaw" / "agents" / "main" / "sessions" / "sessions.json"
+MAIN_SESSION_KEY = "agent:main:main"
+
+
+def get_main_session_id() -> str:
+    """
+    Look up the actual UUID for the main session from OpenClaw's sessions.json.
+    Falls back to the key name if lookup fails (will create new session).
+    """
+    try:
+        if OPENCLAW_SESSIONS_FILE.exists():
+            with open(OPENCLAW_SESSIONS_FILE) as f:
+                sessions = json.load(f)
+            
+            if MAIN_SESSION_KEY in sessions:
+                session_id = sessions[MAIN_SESSION_KEY].get("sessionId")
+                if session_id:
+                    logger.info(f"Resolved main session UUID: {session_id}")
+                    return session_id
+        
+        logger.warning(f"Could not find main session, using key: {MAIN_SESSION_KEY}")
+        return MAIN_SESSION_KEY
+        
+    except Exception as e:
+        logger.error(f"Error reading sessions.json: {e}")
+        return MAIN_SESSION_KEY
+
 
 async def stream_chat_response(
     user_text: str,
-    session_id: str = "agent:main:main"
+    session_id: str | None = None
 ) -> AsyncIterator[str]:
     """
     Stream response chunks from OpenClaw.
@@ -32,7 +62,11 @@ async def stream_chat_response(
         yield "I didn't catch that. Could you please repeat?"
         return
     
-    logger.info(f"Sending to OpenClaw: {user_text[:50]}...")
+    # Resolve session ID to the main session's UUID if not provided
+    if session_id is None:
+        session_id = get_main_session_id()
+    
+    logger.info(f"Sending to OpenClaw (session {session_id[:20]}...): {user_text[:50]}...")
     
     try:
         # Run OpenClaw CLI
@@ -113,7 +147,7 @@ def _split_sentences(text: str) -> list[str]:
     return [s.strip() for s in sentences if s.strip()]
 
 
-async def get_full_response(user_text: str, session_id: str = "agent:main:main") -> str:
+async def get_full_response(user_text: str, session_id: str | None = None) -> str:
     """Get complete response (non-streaming convenience function)."""
     chunks = []
     async for chunk in stream_chat_response(user_text, session_id):
