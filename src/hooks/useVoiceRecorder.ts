@@ -81,8 +81,15 @@ export function useVoiceRecorder(): UseVoiceRecorderReturn {
 
   const stopRecording = useCallback(() => {
     if (mediaRecorderRef.current && mediaRecorderRef.current.state !== 'inactive') {
-      mediaRecorderRef.current.stop();
-      setIsRecording(false);
+      // Request any pending data before stopping to avoid losing trailing audio
+      mediaRecorderRef.current.requestData();
+      // Small delay to allow final chunk to be captured
+      setTimeout(() => {
+        if (mediaRecorderRef.current && mediaRecorderRef.current.state !== 'inactive') {
+          mediaRecorderRef.current.stop();
+        }
+        setIsRecording(false);
+      }, 150);
     }
   }, []);
 

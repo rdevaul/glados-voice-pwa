@@ -34,6 +34,10 @@ def strip_markdown(text: str) -> str:
     text = re.sub(r'^\s*\d+\.\s+', '', text, flags=re.MULTILINE)
     # Remove strikethrough ~~text~~
     text = re.sub(r'~~([^~]+)~~', r'\1', text)
+    # Clean up escaped quotes/apostrophes (from shell escaping)
+    text = text.replace("\\'", "'")
+    text = text.replace('\\"', '"')
+    text = re.sub(r"'\\''", "'", text)  # Handle '\'' shell escape pattern
     # Clean up multiple newlines
     text = re.sub(r'\n{3,}', '\n\n', text)
     return text.strip()
