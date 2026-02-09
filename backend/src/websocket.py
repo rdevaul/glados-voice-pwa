@@ -18,7 +18,7 @@ from starlette.websockets import WebSocketState
 
 from .transcribe import ChunkedTranscriber
 from .stream_response import stream_chat_response, get_all_responses, get_all_responses_with_progress
-from .main import strip_markdown
+from .utils import strip_markdown
 from .session_store import session_store, start_cleanup_task, Session
 
 logging.basicConfig(level=logging.DEBUG)
@@ -542,6 +542,10 @@ class WebSocketManager:
         safe_text = clean_text.replace('\\', '\\\\').replace('"', '\\"').replace('`', '\\`').replace('$', '\\$')
         
         # Debug logging for apostrophe issue - ALWAYS log for now
+        # Using print as fallback in case logger isn't working
+        print(f"TTS DEBUG - Original text (repr): {repr(text[:300])}", flush=True)
+        print(f"TTS DEBUG - After strip_markdown (repr): {repr(clean_text[:300])}", flush=True)
+        print(f"TTS DEBUG - After escaping (repr): {repr(safe_text[:300])}", flush=True)
         logger.info(f"TTS DEBUG - Original text (repr): {repr(text[:300])}")
         logger.info(f"TTS DEBUG - After strip_markdown (repr): {repr(clean_text[:300])}")
         logger.info(f"TTS DEBUG - After escaping (repr): {repr(safe_text[:300])}")
