@@ -541,6 +541,11 @@ class WebSocketManager:
         # In double quotes, only need to escape: double quotes, backticks, backslashes, and $
         safe_text = clean_text.replace('\\', '\\\\').replace('"', '\\"').replace('`', '\\`').replace('$', '\\$')
         
+        # Debug logging for apostrophe issue - ALWAYS log for now
+        logger.info(f"TTS DEBUG - Original text (repr): {repr(text[:300])}")
+        logger.info(f"TTS DEBUG - After strip_markdown (repr): {repr(clean_text[:300])}")
+        logger.info(f"TTS DEBUG - After escaping (repr): {repr(safe_text[:300])}")
+        
         # Piper TTS command
         piper_cmd = f'eval "$(pyenv init -)" && echo "{safe_text}" | piper -m /Users/rich/Projects/piper-models/en_US-lessac-medium.onnx -f {output_file}'
         

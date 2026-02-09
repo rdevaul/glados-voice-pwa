@@ -364,19 +364,41 @@ export function useVoiceStream(wsUrl: string): UseVoiceStreamReturn {
   const stopRecording = useCallback(() => {
     if (!mediaRecorderRef.current) return;
 
-    if (mediaRecorderRef.current.state !== 'inactive') {
-      mediaRecorderRef.current.stop();
-    }
+    const recorder = mediaRecorderRef.current;
+    const ws = wsRef.current;
 
-    // Stop all tracks
-    if (streamRef.current) {
-      streamRef.current.getTracks().forEach(track => track.stop());
-      streamRef.current = null;
-    }
+    if (recorder.state !== 'inactive') {
+      // Request any pending data before stopping
+      recorder.requestData();
+      
+      // Wait for final chunks to be sent, then signal end
+      setTimeout(() => {
+        if (recorder.state !== 'inactive') {
+          recorder.stop();
+        }
+        
+        // Stop all tracks
+        if (streamRef.current) {
+          streamRef.current.getTracks().forEach(track => track.stop());
+          streamRef.current = null;
+        }
 
-    // Send audio_end message
-    if (wsRef.current?.readyState === WebSocket.OPEN) {
-      wsRef.current.send(JSON.stringify({ type: 'audio_end' }));
+        // Send audio_end message after final chunks have been sent
+        setTimeout(() => {
+          if (ws?.readyState === WebSocket.OPEN) {
+            ws.send(JSON.stringify({ type: 'audio_end' }));
+          }
+        }, 100);
+      }, 150);
+    } else {
+      // Already inactive, just cleanup
+      if (streamRef.current) {
+        streamRef.current.getTracks().forEach(track => track.stop());
+        streamRef.current = null;
+      }
+      if (ws?.readyState === WebSocket.OPEN) {
+        ws.send(JSON.stringify({ type: 'audio_end' }));
+      }
     }
 
     mediaRecorderRef.current = null;
