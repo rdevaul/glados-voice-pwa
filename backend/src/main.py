@@ -301,6 +301,40 @@ async def serve_audio(filename: str):
     return FileResponse(file_path, media_type="audio/wav")
 
 
+# Media type mapping for serving images/videos
+MEDIA_TYPES = {
+    ".png": "image/png",
+    ".jpg": "image/jpeg",
+    ".jpeg": "image/jpeg",
+    ".gif": "image/gif",
+    ".webp": "image/webp",
+    ".svg": "image/svg+xml",
+    ".mp4": "video/mp4",
+    ".webm": "video/webm",
+    ".mov": "video/quicktime",
+    ".wav": "audio/wav",
+    ".mp3": "audio/mpeg",
+    ".ogg": "audio/ogg",
+}
+
+
+@app.get("/voice/media/{filename}")
+async def serve_media(filename: str):
+    """Serve media files (images, videos, audio) with correct MIME types."""
+    # Sanitize filename to prevent directory traversal
+    safe_filename = Path(filename).name
+    file_path = AUDIO_CACHE_DIR / safe_filename
+    
+    if not file_path.exists():
+        raise HTTPException(status_code=404, detail="File not found")
+    
+    # Detect media type from extension
+    ext = file_path.suffix.lower()
+    media_type = MEDIA_TYPES.get(ext, "application/octet-stream")
+    
+    return FileResponse(file_path, media_type=media_type)
+
+
 if __name__ == "__main__":
     import uvicorn
     uvicorn.run(app, host="0.0.0.0", port=8100)

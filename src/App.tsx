@@ -1,5 +1,6 @@
 import { useState, useEffect, useRef, useCallback } from 'react';
 import ReactMarkdown from 'react-markdown';
+import type { Components } from 'react-markdown';
 import { useVoiceRecorder } from './hooks/useVoiceRecorder';
 import { useVoiceStream } from './hooks/useVoiceStream';
 import { PushToTalkButton } from './components/PushToTalkButton';
@@ -29,6 +30,62 @@ function getMediaType(url: string): 'image' | 'video' | 'unknown' {
   if (lower.includes('youtube.com') || lower.includes('youtu.be')) return 'video';
   return 'unknown';
 }
+
+// Custom ReactMarkdown components for media rendering
+const markdownComponents: Components = {
+  img: ({ src, alt }) => {
+    if (!src) return null;
+    const mediaType = getMediaType(src);
+    if (mediaType === 'video') {
+      return (
+        <video 
+          src={src} 
+          className="media-video"
+          controls
+          playsInline
+          preload="metadata"
+        />
+      );
+    }
+    return (
+      <img 
+        src={src} 
+        alt={alt || 'Image'} 
+        className="media-image"
+        loading="lazy"
+        onClick={() => window.open(src, '_blank')}
+      />
+    );
+  },
+  // Handle links that might be media files
+  a: ({ href, children }) => {
+    if (!href) return <>{children}</>;
+    const mediaType = getMediaType(href);
+    if (mediaType === 'image') {
+      return (
+        <img 
+          src={href} 
+          alt={String(children) || 'Image'} 
+          className="media-image"
+          loading="lazy"
+          onClick={() => window.open(href, '_blank')}
+        />
+      );
+    }
+    if (mediaType === 'video') {
+      return (
+        <video 
+          src={href} 
+          className="media-video"
+          controls
+          playsInline
+          preload="metadata"
+        />
+      );
+    }
+    return <a href={href} target="_blank" rel="noopener noreferrer">{children}</a>;
+  },
+};
 
 const STORAGE_KEY = 'glados-voice-history';
 const MAX_STORED_MESSAGES = 50;
@@ -523,7 +580,7 @@ function App() {
           <div key={msg.id} className={`message ${msg.role} ${msg.pending ? 'pending' : ''} ${msg.streaming ? 'streaming' : ''}`}>
             <div className="message-text">
               {msg.role === 'assistant' ? (
-                <ReactMarkdown>{msg.text}</ReactMarkdown>
+                <ReactMarkdown components={markdownComponents}>{msg.text}</ReactMarkdown>
               ) : (
                 msg.text
               )}
