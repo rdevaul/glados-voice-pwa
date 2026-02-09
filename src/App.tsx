@@ -13,9 +13,21 @@ interface Message {
   text: string;
   audioUrl?: string;
   audioBlobUrl?: string;
+  mediaUrl?: string;  // Images or video URLs
   timestamp: number;
   pending?: boolean;
   streaming?: boolean;
+}
+
+// Helper to detect media type from URL
+function getMediaType(url: string): 'image' | 'video' | 'unknown' {
+  const lower = url.toLowerCase();
+  if (/\.(jpg|jpeg|png|gif|webp|svg)(\?|$)/.test(lower)) return 'image';
+  if (/\.(mp4|webm|mov|m4v)(\?|$)/.test(lower)) return 'video';
+  // Check for common image/video hosting patterns
+  if (lower.includes('imgur.com') || lower.includes('i.redd.it')) return 'image';
+  if (lower.includes('youtube.com') || lower.includes('youtu.be')) return 'video';
+  return 'unknown';
 }
 
 const STORAGE_KEY = 'glados-voice-history';
@@ -166,7 +178,8 @@ function App() {
                 ...m, 
                 text: stream.responseText, 
                 streaming: !stream.responseComplete,
-                audioUrl: stream.responseComplete ? latestAudioUrl : m.audioUrl
+                audioUrl: stream.responseComplete ? latestAudioUrl : m.audioUrl,
+                mediaUrl: stream.responseComplete ? (stream.responseMediaUrl || m.mediaUrl) : m.mediaUrl
               }
             : m
         ));
@@ -178,6 +191,7 @@ function App() {
           role: 'assistant',
           text: stream.responseText,
           audioUrl: latestAudioUrl,
+          mediaUrl: stream.responseMediaUrl || undefined,
           timestamp: Date.now(),
           pending: false,
           streaming: false,
@@ -190,7 +204,7 @@ function App() {
         currentAssistantMsgRef.current = null;
       }
     }
-  }, [stream.responseText, stream.responseComplete, stream.audioQueue, stream.processingStatus, useStreaming]);
+  }, [stream.responseText, stream.responseComplete, stream.responseMediaUrl, stream.audioQueue, stream.processingStatus, useStreaming]);
 
   // Handle server messages (additional messages from agent)
   const lastServerMsgCountRef = useRef(0);
@@ -213,6 +227,7 @@ function App() {
         role: 'assistant',
         text: serverMsg.text,
         audioUrl,
+        mediaUrl: serverMsg.media_url,
         timestamp: Date.now(),
         pending: false,
         streaming: false,
@@ -514,6 +529,31 @@ function App() {
               )}
               {msg.streaming && <span className="typing-indicator">▋</span>}
             </div>
+            {msg.mediaUrl && (
+              <div className="message-media">
+                {getMediaType(msg.mediaUrl) === 'image' ? (
+                  <img 
+                    src={msg.mediaUrl} 
+                    alt="Response media" 
+                    className="media-image"
+                    loading="lazy"
+                    onClick={() => window.open(msg.mediaUrl, '_blank')}
+                  />
+                ) : getMediaType(msg.mediaUrl) === 'video' ? (
+                  <video 
+                    src={msg.mediaUrl} 
+                    className="media-video"
+                    controls
+                    playsInline
+                    preload="metadata"
+                  />
+                ) : (
+                  <a href={msg.mediaUrl} target="_blank" rel="noopener noreferrer" className="media-link">
+                    📎 View attachment
+                  </a>
+                )}
+              </div>
+            )}
             <div className="message-actions">
               {msg.audioBlobUrl && (
                 <button 

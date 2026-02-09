@@ -89,8 +89,12 @@ body {
   padding: 12px 16px;
   border-radius: 16px;
   display: flex;
-  align-items: center;
+  flex-direction: column;
   gap: 8px;
+}
+
+.message .message-actions {
+  align-self: flex-end;
 }
 
 .message.user {
@@ -197,6 +201,46 @@ body {
   margin: 8px 0;
   padding-left: 12px;
   color: #94a3b8;
+}
+
+/* Media styling for images and videos */
+.message-media {
+  margin: 8px 0;
+  max-width: 100%;
+}
+
+.media-image {
+  max-width: 100%;
+  max-height: 300px;
+  border-radius: 8px;
+  cursor: pointer;
+  object-fit: contain;
+  background: rgba(0, 0, 0, 0.2);
+}
+
+.media-image:hover {
+  opacity: 0.9;
+}
+
+.media-video {
+  max-width: 100%;
+  max-height: 300px;
+  border-radius: 8px;
+  background: #000;
+}
+
+.media-link {
+  display: inline-block;
+  padding: 8px 12px;
+  background: rgba(59, 130, 246, 0.2);
+  border-radius: 8px;
+  color: #3b82f6;
+  text-decoration: none;
+  font-size: 14px;
+}
+
+.media-link:hover {
+  background: rgba(59, 130, 246, 0.3);
 }
 
 .play-button {

@@ -95,6 +95,7 @@ class ResponseCompleteMessage(BaseModel):
     type: str = "response_complete"
     text: str
     audio_url: str
+    media_url: Optional[str] = None
 
 
 class ErrorMessage(BaseModel):
@@ -118,6 +119,7 @@ class ServerMessage(BaseModel):
     message_id: str
     text: str
     audio_url: Optional[str] = None
+    media_url: Optional[str] = None
     reason: str = "follow_up"  # follow_up, correction, proactive, continuation
 
 
@@ -472,15 +474,21 @@ class WebSocketManager:
                 if not response_text:
                     continue
                 
+                # Extract media URL if present (images, videos from OpenClaw)
+                media_url = payload.get("mediaUrl")
+                
                 # Generate TTS for this message
                 audio_url = await self._generate_tts(response_text)
                 logger.info(f"Generated TTS for message {i+1}/{len(payloads)}: {audio_url}")
+                if media_url:
+                    logger.info(f"Media URL for message {i+1}: {media_url}")
                 
                 if i == 0:
                     # First message: send as response_complete
                     response_complete = ResponseCompleteMessage(
                         text=response_text,
-                        audio_url=audio_url
+                        audio_url=audio_url,
+                        media_url=media_url
                     )
                     
                     sent = await self.send_message(response_complete, session_id)
@@ -495,6 +503,7 @@ class WebSocketManager:
                         message_id=str(uuid.uuid4()),
                         text=response_text,
                         audio_url=audio_url,
+                        media_url=media_url,
                         reason="continuation"
                     )
                     

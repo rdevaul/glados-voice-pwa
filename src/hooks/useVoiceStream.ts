@@ -14,6 +14,7 @@ export interface ServerMessage {
   message_id: string;
   text: string;
   audio_url?: string;
+  media_url?: string;
   reason: 'follow_up' | 'correction' | 'proactive' | 'continuation';
 }
 
@@ -29,6 +30,7 @@ export interface UseVoiceStreamReturn {
   finalTranscript: string;
   responseText: string;
   responseComplete: boolean;
+  responseMediaUrl: string | null;
   audioQueue: string[];
   serverMessages: ServerMessage[];
   processingStatus: ProcessingStatus | null;
@@ -52,6 +54,7 @@ export function useVoiceStream(wsUrl: string): UseVoiceStreamReturn {
   const [finalTranscript, setFinalTranscript] = useState('');
   const [responseText, setResponseText] = useState('');
   const [responseComplete, setResponseComplete] = useState(false);
+  const [responseMediaUrl, setResponseMediaUrl] = useState<string | null>(null);
   const [audioQueue, setAudioQueue] = useState<string[]>([]);
   const [serverMessages, setServerMessages] = useState<ServerMessage[]>([]);
   const [processingStatus, setProcessingStatus] = useState<ProcessingStatus | null>(null);
@@ -189,6 +192,7 @@ export function useVoiceStream(wsUrl: string): UseVoiceStreamReturn {
           case 'response_complete':
             setResponseText(data.text);
             setResponseComplete(true);
+            setResponseMediaUrl(data.media_url || null);
             setProcessingStatus(null);  // Clear processing status on completion
             if (data.audio_url) {
               setAudioQueue(prev => [...prev, data.audio_url]);
@@ -210,6 +214,7 @@ export function useVoiceStream(wsUrl: string): UseVoiceStreamReturn {
               message_id: data.message_id,
               text: data.text,
               audio_url: data.audio_url,
+              media_url: data.media_url,
               reason: data.reason || 'follow_up',
             }]);
             if (data.audio_url) {
@@ -447,6 +452,7 @@ export function useVoiceStream(wsUrl: string): UseVoiceStreamReturn {
   const clearResponse = useCallback(() => {
     setResponseText('');
     setResponseComplete(false);
+    setResponseMediaUrl(null);
     setAudioQueue([]);
   }, []);
 
@@ -549,6 +555,7 @@ export function useVoiceStream(wsUrl: string): UseVoiceStreamReturn {
     finalTranscript,
     responseText,
     responseComplete,
+    responseMediaUrl,
     audioQueue,
     serverMessages,
     processingStatus,
