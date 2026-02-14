@@ -50,6 +50,155 @@ def get_main_session_id() -> str:
         return MAIN_SESSION_KEY
 
 
+# Retry configuration for transient failures (e.g., gateway restarts)
+RETRY_MAX_ATTEMPTS = 3
+RETRY_DELAY_SECONDS = 2.0
+
+# Patterns in stderr that are warnings, not errors
+IGNORABLE_STDERR_PATTERNS = [
+    "DeprecationWarning",
+    "ExperimentalWarning", 
+    "punycode",
+    "--trace-deprecation",
+]
+
+
+def _is_transient_error(stderr_text: str, returncode: int) -> bool:
+    """
+    Check if an error is likely transient and worth retrying.
+    
+    Returns True for:
+    - Gateway restart (connection refused, ECONNRESET)
+    - Temporary unavailability
+    - Node.js deprecation warnings treated as errors
+    """
+    if returncode == 0:
+        return False
+    
+    stderr_lower = stderr_text.lower() if stderr_text else ""
+    
+    # Check if stderr only contains ignorable warnings
+    if stderr_text:
+        lines = [l.strip() for l in stderr_text.split('\n') if l.strip()]
+        non_warning_lines = []
+        for line in lines:
+            is_warning = any(pattern.lower() in line.lower() for pattern in IGNORABLE_STDERR_PATTERNS)
+            if not is_warning:
+                non_warning_lines.append(line)
+        
+        # If all lines were warnings, this is a false positive error
+        if not non_warning_lines:
+            return True
+    
+    # Transient network/connection errors
+    transient_patterns = [
+        "econnrefused",
+        "econnreset", 
+        "connection refused",
+        "connection reset",
+        "gateway",
+        "temporarily unavailable",
+        "service unavailable",
+    ]
+    
+    return any(pattern in stderr_lower for pattern in transient_patterns)
+
+
+def _filter_stderr(stderr_text: str) -> str:
+    """
+    Filter out harmless warnings from stderr, returning only real errors.
+    """
+    if not stderr_text:
+        return ""
+    
+    lines = stderr_text.split('\n')
+    error_lines = []
+    
+    for line in lines:
+        line = line.strip()
+        if not line:
+            continue
+        
+        # Skip lines that are just warnings
+        is_warning = any(pattern.lower() in line.lower() for pattern in IGNORABLE_STDERR_PATTERNS)
+        if not is_warning:
+            error_lines.append(line)
+    
+    return '\n'.join(error_lines)
+
+
+async def _run_openclaw_with_retry(
+    cmd: list[str],
+    timeout: float = 130,
+    max_attempts: int = RETRY_MAX_ATTEMPTS,
+    retry_delay: float = RETRY_DELAY_SECONDS,
+) -> tuple[bytes, bytes, int]:
+    """
+    Run OpenClaw CLI with retry logic for transient failures.
+    
+    Returns:
+        Tuple of (stdout, stderr, returncode)
+    """
+    last_exception = None
+    last_stderr = b""
+    last_returncode = -1
+    
+    for attempt in range(1, max_attempts + 1):
+        try:
+            process = await asyncio.create_subprocess_exec(
+                *cmd,
+                stdout=asyncio.subprocess.PIPE,
+                stderr=asyncio.subprocess.PIPE
+            )
+            
+            stdout, stderr = await asyncio.wait_for(
+                process.communicate(),
+                timeout=timeout
+            )
+            
+            returncode = process.returncode
+            stderr_text = stderr.decode() if stderr else ""
+            
+            # Success - return immediately
+            if returncode == 0:
+                # Log any warnings that were in stderr
+                filtered = _filter_stderr(stderr_text)
+                if filtered:
+                    logger.warning(f"OpenClaw warnings (ignored): {filtered[:200]}")
+                return stdout, stderr, returncode
+            
+            # Check if this is a transient error worth retrying
+            if attempt < max_attempts and _is_transient_error(stderr_text, returncode):
+                logger.warning(
+                    f"OpenClaw transient error (attempt {attempt}/{max_attempts}), "
+                    f"retrying in {retry_delay}s: {stderr_text[:100]}"
+                )
+                await asyncio.sleep(retry_delay)
+                continue
+            
+            # Non-transient error or last attempt - return as-is
+            return stdout, stderr, returncode
+            
+        except asyncio.TimeoutError:
+            last_exception = asyncio.TimeoutError()
+            if attempt < max_attempts:
+                logger.warning(f"OpenClaw timeout (attempt {attempt}/{max_attempts}), retrying...")
+                await asyncio.sleep(retry_delay)
+                continue
+            raise
+            
+        except Exception as e:
+            last_exception = e
+            if attempt < max_attempts:
+                logger.warning(f"OpenClaw error (attempt {attempt}/{max_attempts}): {e}, retrying...")
+                await asyncio.sleep(retry_delay)
+                continue
+            raise
+    
+    # Should not reach here, but just in case
+    return b"", last_stderr, last_returncode
+
+
 async def stream_chat_response(
     user_text: str,
     session_id: str | None = None
@@ -78,7 +227,7 @@ async def stream_chat_response(
     logger.info(f"Sending to OpenClaw (session {session_id[:20]}...): {user_text[:50]}...")
     
     try:
-        # Run OpenClaw CLI
+        # Run OpenClaw CLI with retry logic
         cmd = [
             "openclaw", "agent",
             "--message", user_text,
@@ -87,18 +236,9 @@ async def stream_chat_response(
             "--timeout", "120"
         ]
         
-        process = await asyncio.create_subprocess_exec(
-            *cmd,
-            stdout=asyncio.subprocess.PIPE,
-            stderr=asyncio.subprocess.PIPE
-        )
+        stdout, stderr, returncode = await _run_openclaw_with_retry(cmd, timeout=130)
         
-        stdout, stderr = await asyncio.wait_for(
-            process.communicate(),
-            timeout=130
-        )
-        
-        if process.returncode == 0:
+        if returncode == 0:
             try:
                 response_data = json.loads(stdout.decode())
                 payloads = response_data.get("result", {}).get("payloads", [])
@@ -128,7 +268,8 @@ async def stream_chat_response(
                 else:
                     yield "I received your message."
         else:
-            error_msg = stderr.decode()[:200] if stderr else "Unknown error"
+            error_msg = _filter_stderr(stderr.decode()) if stderr else "Unknown error"
+            error_msg = error_msg[:200] if error_msg else "Unknown error"
             logger.error(f"OpenClaw error: {error_msg}")
             yield f"Sorry, I encountered an error processing your request."
             
@@ -188,7 +329,7 @@ async def get_all_responses(user_text: str, session_id: str | None = None) -> li
     logger.info(f"Sending to OpenClaw (session {session_id[:20]}...): {user_text[:50]}...")
     
     try:
-        # Run OpenClaw CLI
+        # Run OpenClaw CLI with retry logic
         cmd = [
             "openclaw", "agent",
             "--message", user_text,
@@ -197,18 +338,9 @@ async def get_all_responses(user_text: str, session_id: str | None = None) -> li
             "--timeout", "120"
         ]
         
-        process = await asyncio.create_subprocess_exec(
-            *cmd,
-            stdout=asyncio.subprocess.PIPE,
-            stderr=asyncio.subprocess.PIPE
-        )
+        stdout, stderr, returncode = await _run_openclaw_with_retry(cmd, timeout=130)
         
-        stdout, stderr = await asyncio.wait_for(
-            process.communicate(),
-            timeout=130
-        )
-        
-        if process.returncode == 0:
+        if returncode == 0:
             try:
                 response_data = json.loads(stdout.decode())
                 payloads = response_data.get("result", {}).get("payloads", [])
@@ -238,7 +370,8 @@ async def get_all_responses(user_text: str, session_id: str | None = None) -> li
                     return [{"text": raw, "mediaUrl": None}]
                 return [{"text": "I received your message.", "mediaUrl": None}]
         else:
-            error_msg = stderr.decode()[:200] if stderr else "Unknown error"
+            error_msg = _filter_stderr(stderr.decode()) if stderr else "Unknown error"
+            error_msg = error_msg[:200] if error_msg else "Unknown error"
             logger.error(f"OpenClaw error: {error_msg}")
             return [{"text": "Sorry, I encountered an error processing your request.", "mediaUrl": None}]
             
@@ -311,7 +444,7 @@ async def get_all_responses_with_progress(
             raise
     
     try:
-        # Run OpenClaw CLI
+        # Run OpenClaw CLI with retry logic
         cmd = [
             "openclaw", "agent",
             "--message", user_text,
@@ -320,20 +453,16 @@ async def get_all_responses_with_progress(
             "--timeout", str(max_timeout - 10)  # Leave buffer for subprocess timeout
         ]
         
-        process = await asyncio.create_subprocess_exec(
-            *cmd,
-            stdout=asyncio.subprocess.PIPE,
-            stderr=asyncio.subprocess.PIPE
-        )
-        
         # Start progress heartbeat
         if progress_callback:
             progress_task = asyncio.create_task(send_progress())
         
         try:
-            stdout, stderr = await asyncio.wait_for(
-                process.communicate(),
-                timeout=max_timeout
+            stdout, stderr, returncode = await _run_openclaw_with_retry(
+                cmd, 
+                timeout=max_timeout,
+                max_attempts=RETRY_MAX_ATTEMPTS,
+                retry_delay=RETRY_DELAY_SECONDS
             )
         finally:
             # Always cancel progress task when done
@@ -344,7 +473,7 @@ async def get_all_responses_with_progress(
                 except asyncio.CancelledError:
                     pass
         
-        if process.returncode == 0:
+        if returncode == 0:
             try:
                 response_data = json.loads(stdout.decode())
                 payloads = response_data.get("result", {}).get("payloads", [])
@@ -374,7 +503,8 @@ async def get_all_responses_with_progress(
                     return [{"text": raw, "mediaUrl": None}]
                 return [{"text": "I received your message.", "mediaUrl": None}]
         else:
-            error_msg = stderr.decode()[:200] if stderr else "Unknown error"
+            error_msg = _filter_stderr(stderr.decode()) if stderr else "Unknown error"
+            error_msg = error_msg[:200] if error_msg else "Unknown error"
             logger.error(f"OpenClaw error: {error_msg}")
             return [{"text": "Sorry, I encountered an error processing your request.", "mediaUrl": None}]
             

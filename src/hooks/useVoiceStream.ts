@@ -87,12 +87,23 @@ export function useVoiceStream(wsUrl: string): UseVoiceStreamReturn {
   }, [status, partialTranscript, responseText, audioQueue]);
 
   // Build WebSocket URL with session ID for reconnection
+  // Safari-compatible: avoid URL constructor issues
   const buildWsUrl = useCallback((sid?: string | null) => {
-    const url = new URL(wsUrl);
-    if (sid) {
-      url.searchParams.set('session_id', sid);
+    try {
+      const url = new URL(wsUrl);
+      if (sid) {
+        url.searchParams.set('session_id', sid);
+      }
+      return url.toString();
+    } catch (e) {
+      // Fallback for Safari URL parsing issues
+      console.warn('URL parsing failed, using fallback:', e);
+      if (sid) {
+        const separator = wsUrl.includes('?') ? '&' : '?';
+        return `${wsUrl}${separator}session_id=${encodeURIComponent(sid)}`;
+      }
+      return wsUrl;
     }
-    return url.toString();
   }, [wsUrl]);
 
   const connect = useCallback(() => {
@@ -113,10 +124,25 @@ export function useVoiceStream(wsUrl: string): UseVoiceStreamReturn {
     const connectUrl = buildWsUrl(savedSessionId);
     console.log('Connecting to:', connectUrl);
     
-    const ws = new WebSocket(connectUrl);
+    // Safari detection for debugging
+    const isSafari = /^((?!chrome|android).)*safari/i.test(navigator.userAgent);
+    if (isSafari) {
+      console.log('Safari detected - using compatibility mode');
+    }
+    
+    let ws: WebSocket;
+    try {
+      ws = new WebSocket(connectUrl);
+    } catch (e) {
+      console.error('WebSocket constructor failed:', e);
+      setError(`Failed to create WebSocket: ${e instanceof Error ? e.message : 'Unknown error'}`);
+      setStatus('disconnected');
+      return;
+    }
     wsRef.current = ws;
 
     ws.onopen = () => {
+      console.log('WebSocket connected successfully');
       reconnectDelayIndexRef.current = 0;
       // Don't set ready here - wait for 'ready' or 'session_restored' message
     };
@@ -258,8 +284,18 @@ export function useVoiceStream(wsUrl: string): UseVoiceStreamReturn {
     };
 
     ws.onerror = (event) => {
+      // Safari often gives minimal error info - log everything available
       console.error('WebSocket error:', event);
-      setError('WebSocket connection error');
+      console.error('WebSocket readyState:', ws.readyState);
+      console.error('WebSocket url:', ws.url);
+      
+      // More descriptive error for Safari
+      const isSafari = /^((?!chrome|android).)*safari/i.test(navigator.userAgent);
+      if (isSafari) {
+        setError('WebSocket connection error (Safari). Try using Chrome for better compatibility.');
+      } else {
+        setError('WebSocket connection error');
+      }
     };
   }, [wsUrl, buildWsUrl, saveState]);
 
@@ -311,11 +347,20 @@ export function useVoiceStream(wsUrl: string): UseVoiceStreamReturn {
       return;
     }
     
-    if (status !== 'ready') return;
+    // Allow recording anytime except when already recording
+    // (async model: don't block on processing/waiting for response)
+    if (status === 'recording') return;
 
     try {
       // Get microphone access
-      const stream = await navigator.mediaDevices.getUserMedia({ audio: true });
+      // Enable browser-level audio processing for better quality
+      const stream = await navigator.mediaDevices.getUserMedia({ 
+        audio: {
+          echoCancellation: true,
+          noiseSuppression: true,
+          autoGainControl: true,
+        }
+      });
       streamRef.current = stream;
 
       // Determine best supported format
@@ -352,12 +397,10 @@ export function useVoiceStream(wsUrl: string): UseVoiceStreamReturn {
       mediaRecorder.start(250);
       setStatus('recording');
       
-      // Clear previous response
-      setResponseText('');
-      setResponseComplete(false);
+      // Async model: don't clear previous responses - let them accumulate
+      // Only clear transcript state for the new recording
       setPartialTranscript('');
       setFinalTranscript('');
-      setProcessingStatus(null);
 
     } catch (err) {
       const message = err instanceof Error ? err.message : 'Failed to start recording';
@@ -407,7 +450,9 @@ export function useVoiceStream(wsUrl: string): UseVoiceStreamReturn {
     }
 
     mediaRecorderRef.current = null;
-    setStatus('processing');
+    // Async model: return to ready immediately so user can record again
+    // Don't wait for response - it will arrive and display asynchronously
+    setStatus('ready');
   }, []);
 
   const sendText = useCallback((text: string) => {
@@ -416,15 +461,12 @@ export function useVoiceStream(wsUrl: string): UseVoiceStreamReturn {
       return;
     }
     
-    if (status !== 'ready') return;
+    // Allow sending text anytime (except while recording)
+    if (status === 'recording') return;
 
     wsRef.current.send(JSON.stringify({ type: 'text', content: text }));
-    setStatus('processing');
-    
-    // Clear previous response
-    setResponseText('');
-    setResponseComplete(false);
-    setProcessingStatus(null);
+    // Async model: stay ready, don't block on response
+    // Response will arrive asynchronously
   }, [status]);
 
   const cancel = useCallback(() => {

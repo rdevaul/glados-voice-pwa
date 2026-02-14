@@ -1,6 +1,7 @@
 import { useState, useEffect, useRef, useCallback } from 'react';
 import ReactMarkdown from 'react-markdown';
 import type { Components } from 'react-markdown';
+import remarkGfm from 'remark-gfm';
 import { useVoiceRecorder } from './hooks/useVoiceRecorder';
 import { useVoiceStream } from './hooks/useVoiceStream';
 import { PushToTalkButton } from './components/PushToTalkButton';
@@ -21,10 +22,11 @@ interface Message {
 }
 
 // Helper to detect media type from URL
-function getMediaType(url: string): 'image' | 'video' | 'unknown' {
+function getMediaType(url: string): 'image' | 'video' | 'audio' | 'unknown' {
   const lower = url.toLowerCase();
   if (/\.(jpg|jpeg|png|gif|webp|svg)(\?|$)/.test(lower)) return 'image';
   if (/\.(mp4|webm|mov|m4v)(\?|$)/.test(lower)) return 'video';
+  if (/\.(mp3|wav|ogg|m4a|aac|flac|opus)(\?|$)/.test(lower)) return 'audio';
   // Check for common image/video hosting patterns
   if (lower.includes('imgur.com') || lower.includes('i.redd.it')) return 'image';
   if (lower.includes('youtube.com') || lower.includes('youtu.be')) return 'video';
@@ -83,6 +85,16 @@ const markdownComponents: Components = {
         />
       );
     }
+    if (mediaType === 'audio') {
+      return (
+        <audio 
+          src={href} 
+          className="media-audio"
+          controls
+          preload="metadata"
+        />
+      );
+    }
     return <a href={href} target="_blank" rel="noopener noreferrer">{children}</a>;
   },
 };
@@ -132,7 +144,12 @@ function App() {
   const audioRef = useRef<HTMLAudioElement | null>(null);
   const processedBlobRef = useRef<Blob | null>(null);
   const abortControllerRef = useRef<AbortController | null>(null);
+  // Queue of assistant message IDs for async model - responses are matched in order
+  const assistantMsgQueueRef = useRef<string[]>([]);
   const currentAssistantMsgRef = useRef<string | null>(null);
+  // Track last processed transcript/response to avoid duplicates
+  const lastProcessedTranscriptRef = useRef<string>('');
+  const lastProcessedResponseRef = useRef<string>('');
   
   // Batch mode hooks
   const { isRecording: batchIsRecording, startRecording: batchStartRecording, 
@@ -147,7 +164,8 @@ function App() {
   const error = useStreaming ? stream.error : batchError;
   const isConnected = stream.status !== 'disconnected' && stream.status !== 'reconnecting';
   const isReconnecting = stream.status === 'reconnecting';
-  const isStreamProcessing = stream.status === 'processing';
+  // Async model: we no longer block on processing state
+  // const isStreamProcessing = stream.status === 'processing';
 
   // Track if we've initiated connection to avoid loops
   const connectionInitiated = useRef(false);
@@ -186,20 +204,52 @@ function App() {
   useEffect(() => {
     if (!useStreaming) return;
     
-    if (stream.finalTranscript) {
-      // Update user message with final transcript
-      setMessages(prev => prev.map(m => 
-        m.pending && m.role === 'user' 
-          ? { ...m, text: stream.finalTranscript, pending: false }
-          : m
-      ));
+    if (stream.finalTranscript && stream.finalTranscript !== lastProcessedTranscriptRef.current) {
+      // Mark as processed to avoid duplicates on re-render
+      lastProcessedTranscriptRef.current = stream.finalTranscript;
+      
+      // Update user message with final transcript AND create assistant placeholder
+      const assistantId = crypto.randomUUID();
+      
+      setMessages(prev => {
+        // Only update the FIRST pending user message (not all of them!)
+        let foundPending = false;
+        const updated = prev.map(m => {
+          if (!foundPending && m.pending && m.role === 'user') {
+            foundPending = true;
+            return { ...m, text: stream.finalTranscript, pending: false };
+          }
+          return m;
+        });
+        
+        // Always create a new assistant placeholder for each transcript
+        return [...updated, {
+          id: assistantId,
+          role: 'assistant' as const,
+          text: '⏳ Thinking...',
+          timestamp: Date.now(),
+          streaming: true,
+        }];
+      });
+      
+      // Add to queue - responses will be matched in order
+      assistantMsgQueueRef.current.push(assistantId);
+      // Set current for backward compat with response handler
+      if (!currentAssistantMsgRef.current) {
+        currentAssistantMsgRef.current = assistantId;
+      }
     } else if (stream.partialTranscript) {
-      // Update user message with partial transcript
-      setMessages(prev => prev.map(m => 
-        m.pending && m.role === 'user' 
-          ? { ...m, text: `🎤 ${stream.partialTranscript}` }
-          : m
-      ));
+      // Update only the FIRST pending user message with partial transcript
+      setMessages(prev => {
+        let foundPending = false;
+        return prev.map(m => {
+          if (!foundPending && m.pending && m.role === 'user') {
+            foundPending = true;
+            return { ...m, text: `🎤 ${stream.partialTranscript}` };
+          }
+          return m;
+        });
+      });
     }
   }, [stream.partialTranscript, stream.finalTranscript, useStreaming]);
 
@@ -223,6 +273,11 @@ function App() {
     }
     
     if (stream.responseText) {
+      // Skip if we already processed this exact response (avoid duplicates)
+      if (stream.responseComplete && stream.responseText === lastProcessedResponseRef.current) {
+        return;
+      }
+      
       const latestAudioUrl = stream.audioQueue.length > 0 
         ? getAudioUrl(stream.audioQueue[stream.audioQueue.length - 1])
         : undefined;
@@ -255,10 +310,14 @@ function App() {
         }]);
       }
       
-      // Clear state when complete
+      // Clear state when complete and advance to next queued message
       if (stream.responseComplete) {
+        // Mark as processed to avoid duplicates
+        lastProcessedResponseRef.current = stream.responseText;
         setIsProcessing(false);
-        currentAssistantMsgRef.current = null;
+        // Remove completed message from queue and set next one as current
+        assistantMsgQueueRef.current.shift();
+        currentAssistantMsgRef.current = assistantMsgQueueRef.current[0] || null;
       }
     }
   }, [stream.responseText, stream.responseComplete, stream.responseMediaUrl, stream.audioQueue, stream.processingStatus, useStreaming]);
@@ -367,17 +426,18 @@ function App() {
 
   // Streaming mode handlers
   const handleStreamingStart = async () => {
-    if (stream.status !== 'ready') return;
+    // Async model: allow starting recording anytime (except while already recording)
+    if (stream.status === 'recording') return;
     
-    setIsProcessing(true);
-    stream.clearResponse();
+    // Don't clear previous responses - let them accumulate
+    // Don't set isProcessing - async model doesn't block
     
-    // Add pending user message
+    // Add pending user message (will be updated with transcript)
     addMessage('user', '🎤 Recording...', { pending: true });
     
-    // Add placeholder assistant message for streaming
-    const assistantId = addMessage('assistant', '...', { streaming: true });
-    currentAssistantMsgRef.current = assistantId;
+    // Don't add assistant placeholder yet - wait for transcript to be confirmed
+    // This prevents the "lost response" bug when multiple recordings overlap
+    currentAssistantMsgRef.current = null;
     
     await stream.startRecording();
   };
@@ -388,12 +448,12 @@ function App() {
 
   const handleStreamingTextSubmit = (e: React.FormEvent) => {
     e.preventDefault();
-    if (!textInput.trim() || stream.status !== 'ready') return;
+    // Async model: allow sending anytime except while recording
+    if (!textInput.trim() || stream.status === 'recording') return;
 
     const text = textInput.trim();
     setTextInput('');
-    setIsProcessing(true);
-    stream.clearResponse();
+    // Don't set isProcessing or clear response - async model
     
     // Add user message
     addMessage('user', text);
@@ -580,7 +640,7 @@ function App() {
           <div key={msg.id} className={`message ${msg.role} ${msg.pending ? 'pending' : ''} ${msg.streaming ? 'streaming' : ''}`}>
             <div className="message-text">
               {msg.role === 'assistant' ? (
-                <ReactMarkdown components={markdownComponents}>{msg.text}</ReactMarkdown>
+                <ReactMarkdown remarkPlugins={[remarkGfm]} components={markdownComponents}>{msg.text}</ReactMarkdown>
               ) : (
                 msg.text
               )}
@@ -602,6 +662,13 @@ function App() {
                     className="media-video"
                     controls
                     playsInline
+                    preload="metadata"
+                  />
+                ) : getMediaType(msg.mediaUrl) === 'audio' ? (
+                  <audio 
+                    src={msg.mediaUrl} 
+                    className="media-audio"
+                    controls
                     preload="metadata"
                   />
                 ) : (
@@ -643,7 +710,7 @@ function App() {
           isRecording={isRecording}
           onStartRecording={handleStartRecording}
           onStopRecording={handleStopRecording}
-          disabled={isProcessing || isStreamProcessing || micPermission === 'denied' || (useStreaming && !isConnected)}
+          disabled={isRecording || micPermission === 'denied' || (useStreaming && !isConnected)}
         />
         
         <form className="text-input-form" onSubmit={handleTextSubmit}>
@@ -652,11 +719,11 @@ function App() {
             value={textInput}
             onChange={(e) => setTextInput(e.target.value)}
             placeholder="Or type here..."
-            disabled={isProcessing || (useStreaming && !isConnected)}
+            disabled={(useStreaming ? isRecording : isProcessing) || (useStreaming && !isConnected)}
           />
           <button 
             type="submit" 
-            disabled={isProcessing || !textInput.trim() || (useStreaming && !isConnected)}
+            disabled={(useStreaming ? isRecording : isProcessing) || !textInput.trim() || (useStreaming && !isConnected)}
           >
             Send
           </button>

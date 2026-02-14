@@ -10,9 +10,66 @@ Supports:
 
 import asyncio
 import logging
+import os
 from typing import Dict, Optional, Any, List
 
+import httpx
 from fastapi import FastAPI, WebSocket, WebSocketDisconnect
+
+# OpenAI TTS setup (optional - falls back to Piper if not configured or on error)
+_openai_client = None
+OPENAI_TTS_VOICE = os.environ.get("OPENAI_TTS_VOICE", "nova")  # nova, alloy, echo, fable, onyx, shimmer
+OPENAI_TTS_MODEL = os.environ.get("OPENAI_TTS_MODEL", "tts-1")  # tts-1 or tts-1-hd
+
+# Telegram notification setup (CC responses to Telegram for mobile notifications)
+TELEGRAM_BOT_TOKEN = os.environ.get("TELEGRAM_BOT_TOKEN")
+TELEGRAM_NOTIFY_CHAT_ID = os.environ.get("TELEGRAM_NOTIFY_CHAT_ID", "994902066")  # Rich's user ID
+
+
+async def notify_telegram(text: str, source: str = "Voice PWA") -> None:
+    """Send a notification to Telegram when Voice PWA gets a response.
+    
+    This provides mobile notifications even when the PWA is backgrounded.
+    """
+    if not TELEGRAM_BOT_TOKEN:
+        logger.debug("Telegram notification skipped - no bot token configured")
+        return
+    
+    try:
+        # Truncate long messages for notification preview
+        preview = text[:500] + "…" if len(text) > 500 else text
+        message = f"🎤 {source}:\n{preview}"
+        
+        async with httpx.AsyncClient() as client:
+            response = await client.post(
+                f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/sendMessage",
+                json={
+                    "chat_id": TELEGRAM_NOTIFY_CHAT_ID,
+                    "text": message,
+                    "disable_notification": False,  # We want the notification!
+                },
+                timeout=10.0
+            )
+            if response.status_code == 200:
+                logger.info("Telegram notification sent")
+            else:
+                logger.warning(f"Telegram notification failed: {response.text}")
+    except Exception as e:
+        logger.warning(f"Telegram notification error: {e}")
+
+
+def get_openai_client():
+    """Lazy-load OpenAI client."""
+    global _openai_client
+    if _openai_client is None:
+        api_key = os.environ.get("OPENAI_API_KEY")
+        if api_key:
+            try:
+                from openai import OpenAI
+                _openai_client = OpenAI(api_key=api_key)
+            except ImportError:
+                logging.warning("OpenAI package not installed, using Piper only")
+    return _openai_client
 from pydantic import BaseModel, Field
 from starlette.websockets import WebSocketState
 
@@ -94,7 +151,7 @@ class ResponseChunkMessage(BaseModel):
 class ResponseCompleteMessage(BaseModel):
     type: str = "response_complete"
     text: str
-    audio_url: str
+    audio_url: Optional[str] = None
     media_url: Optional[str] = None
 
 
@@ -410,8 +467,20 @@ class WebSocketManager:
         logger.info(f"Transcriber buffer size: {len(transcriber.audio_buffer)} bytes")
         transcript = await transcriber.finalize()
         
-        if not transcript:
-            transcript = "[Could not transcribe audio]"
+        if not transcript or transcript.strip() == "":
+            # Failed transcription - don't forward to agent, just notify user and reset
+            logger.info("Transcription failed or empty - not forwarding to agent")
+            await self.send_message(
+                FinalTranscriptMessage(text="[Audio too short or unclear]"),
+                session_id
+            )
+            # Send response_complete with empty text to reset frontend state
+            await self.send_message(
+                ResponseCompleteMessage(text="", audio_url=None),
+                session_id
+            )
+            await session_store.update_session(session_id, state='idle')
+            return
             
         logger.info(f"Transcribed: {transcript[:100]}...")
         
@@ -468,6 +537,12 @@ class WebSocketManager:
             )
             
             logger.info(f"Received {len(payloads)} payload(s) from OpenClaw")
+            
+            # CC first response to Telegram for mobile notifications
+            if payloads:
+                first_text = payloads[0].get("text", "")
+                if first_text:
+                    await notify_telegram(first_text, source="GLaDOS")
             
             for i, payload in enumerate(payloads):
                 response_text = payload.get("text", "")
@@ -535,29 +610,58 @@ class WebSocketManager:
             await session_store.update_session(session_id, state='idle')
 
     async def _generate_tts(self, text: str) -> str:
-        """Generate TTS audio for response text."""
+        """Generate TTS audio for response text. Tries OpenAI first, falls back to Piper."""
         import uuid
         from pathlib import Path
         
-        # Use the existing TTS setup from main.py
         audio_id = uuid.uuid4().hex
         output_dir = Path("audio_cache")
         output_dir.mkdir(exist_ok=True)
+        
+        # Strip markdown for cleaner speech
+        clean_text = strip_markdown(text)
+        
+        # Try OpenAI TTS first
+        openai_client = get_openai_client()
+        if openai_client:
+            try:
+                output_file = output_dir / f"{audio_id}.mp3"
+                logger.info(f"Trying OpenAI TTS (voice={OPENAI_TTS_VOICE}, model={OPENAI_TTS_MODEL})")
+                
+                # Run in thread pool since OpenAI client is sync
+                loop = asyncio.get_event_loop()
+                response = await loop.run_in_executor(
+                    None,
+                    lambda: openai_client.audio.speech.create(
+                        model=OPENAI_TTS_MODEL,
+                        voice=OPENAI_TTS_VOICE,
+                        input=clean_text,
+                        response_format="mp3"
+                    )
+                )
+                
+                # Write the audio file
+                await loop.run_in_executor(
+                    None,
+                    lambda: response.stream_to_file(str(output_file))
+                )
+                
+                if output_file.exists():
+                    logger.info(f"OpenAI TTS succeeded: {output_file}")
+                    return f"/voice/audio/{audio_id}.mp3"
+                else:
+                    logger.warning("OpenAI TTS did not produce output file, falling back to Piper")
+                    
+            except Exception as e:
+                logger.warning(f"OpenAI TTS failed ({e}), falling back to Piper")
+        
+        # Fallback to Piper
         output_file = output_dir / f"{audio_id}.wav"
         
-        # Strip markdown and escape text for shell (double-quoted context)
-        clean_text = strip_markdown(text)
-        # In double quotes, only need to escape: double quotes, backticks, backslashes, and $
+        # Escape text for shell (double-quoted context)
         safe_text = clean_text.replace('\\', '\\\\').replace('"', '\\"').replace('`', '\\`').replace('$', '\\$')
         
-        # Debug logging for apostrophe issue - ALWAYS log for now
-        # Using print as fallback in case logger isn't working
-        print(f"TTS DEBUG - Original text (repr): {repr(text[:300])}", flush=True)
-        print(f"TTS DEBUG - After strip_markdown (repr): {repr(clean_text[:300])}", flush=True)
-        print(f"TTS DEBUG - After escaping (repr): {repr(safe_text[:300])}", flush=True)
-        logger.info(f"TTS DEBUG - Original text (repr): {repr(text[:300])}")
-        logger.info(f"TTS DEBUG - After strip_markdown (repr): {repr(clean_text[:300])}")
-        logger.info(f"TTS DEBUG - After escaping (repr): {repr(safe_text[:300])}")
+        logger.info(f"Using Piper TTS fallback")
         
         # Piper TTS command
         piper_cmd = f'eval "$(pyenv init -)" && echo "{safe_text}" | piper -m /Users/rich/Projects/piper-models/en_US-lessac-medium.onnx -f {output_file}'

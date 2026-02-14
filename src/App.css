@@ -229,6 +229,13 @@ body {
   background: #000;
 }
 
+.media-audio {
+  width: 100%;
+  max-width: 400px;
+  border-radius: 8px;
+  background: rgba(0, 0, 0, 0.3);
+}
+
 .media-link {
   display: inline-block;
   padding: 8px 12px;
@@ -315,4 +322,33 @@ body {
   .controls {
     padding-bottom: calc(20px + env(safe-area-inset-bottom));
   }
+}
+
+/* Markdown table styling */
+.message table {
+  border-collapse: collapse;
+  margin: 8px 0;
+  font-size: 14px;
+  width: 100%;
+  overflow-x: auto;
+  display: block;
+}
+
+.message th, .message td {
+  border: 1px solid #4b5563;
+  padding: 6px 10px;
+  text-align: left;
+}
+
+.message th {
+  background: rgba(255, 255, 255, 0.1);
+  font-weight: 600;
+}
+
+.message.assistant th {
+  background: rgba(0, 0, 0, 0.2);
+}
+
+.message tr:nth-child(even) {
+  background: rgba(255, 255, 255, 0.05);
 }
