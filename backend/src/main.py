@@ -298,7 +298,11 @@ async def serve_audio(filename: str):
     if not file_path.exists():
         raise HTTPException(status_code=404, detail="File not found")
 
-    return FileResponse(file_path, media_type="audio/wav")
+    # Detect media type from extension
+    ext = file_path.suffix.lower()
+    media_type = MEDIA_TYPES.get(ext, "audio/wav")
+    
+    return FileResponse(file_path, media_type=media_type)
 
 
 # Media type mapping for serving images/videos
