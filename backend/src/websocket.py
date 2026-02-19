@@ -566,10 +566,11 @@ class WebSocketManager:
                         media_url=media_url
                     )
                     
-                    sent = await self.send_message(response_complete, session_id)
-                    
-                    if not sent:
-                        await session_store.queue_message(session_id, response_complete.dict())
+                    # Queue BEFORE send so message survives if connection drops during/after
+                    # send. Pending queue is cleared on next reconnect delivery. Frontend
+                    # deduplicates by response text + audio URL.
+                    await session_store.queue_message(session_id, response_complete.dict())
+                    await self.send_message(response_complete, session_id)
                     
                     logger.info(f"Sent response_complete with audio_url: {audio_url}")
                 else:
@@ -582,10 +583,10 @@ class WebSocketManager:
                         reason="continuation"
                     )
                     
-                    sent = await self.send_message(server_msg, session_id)
-                    
-                    if not sent:
-                        await session_store.queue_message(session_id, server_msg.dict())
+                    # Queue before send — guarantees delivery on reconnect.
+                    # Frontend deduplicates by message_id.
+                    await session_store.queue_message(session_id, server_msg.dict())
+                    await self.send_message(server_msg, session_id)
                     
                     logger.info(f"Sent server_message {i+1}/{len(payloads)} with audio_url: {audio_url}")
                 
