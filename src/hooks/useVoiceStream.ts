@@ -63,6 +63,7 @@ export function useVoiceStream(wsUrl: string): UseVoiceStreamReturn {
   const wsRef = useRef<WebSocket | null>(null);
   const mediaRecorderRef = useRef<MediaRecorder | null>(null);
   const streamRef = useRef<MediaStream | null>(null);
+  const isRecordingRef = useRef(false);
   const reconnectDelayIndexRef = useRef(0);
   const shouldReconnectRef = useRef(true);
   const sessionIdRef = useRef<string | null>(null);
@@ -342,14 +343,45 @@ export function useVoiceStream(wsUrl: string): UseVoiceStreamReturn {
   }, [saveState]);
 
   const startRecording = useCallback(async () => {
+    // Prevent overlapping recordings with ref (avoids stale closure)
+    if (isRecordingRef.current) {
+      console.warn('Recording already in progress, ignoring start request');
+      return;
+    }
+
+    // Clean up any stale recorder before starting
+    if (mediaRecorderRef.current) {
+      try {
+        if (mediaRecorderRef.current.state !== 'inactive') {
+          mediaRecorderRef.current.stop();
+        }
+      } catch (e) {
+        console.warn('Error stopping stale recorder:', e);
+      }
+      mediaRecorderRef.current = null;
+    }
+
+    // Clean up any stale stream
+    if (streamRef.current) {
+      streamRef.current.getTracks().forEach(track => track.stop());
+      streamRef.current = null;
+    }
+
+    // Set recording lock immediately
+    isRecordingRef.current = true;
+
     if (!wsRef.current || wsRef.current.readyState !== WebSocket.OPEN) {
       setError('WebSocket not connected');
+      isRecordingRef.current = false;
       return;
     }
     
     // Allow recording anytime except when already recording
     // (async model: don't block on processing/waiting for response)
-    if (status === 'recording') return;
+    if (status === 'recording') {
+      isRecordingRef.current = false;
+      return;
+    }
 
     try {
       // Get microphone access
@@ -403,6 +435,7 @@ export function useVoiceStream(wsUrl: string): UseVoiceStreamReturn {
       setFinalTranscript('');
 
     } catch (err) {
+      isRecordingRef.current = false;
       const message = err instanceof Error ? err.message : 'Failed to start recording';
       setError(message);
       console.error('Recording error:', err);
@@ -410,6 +443,12 @@ export function useVoiceStream(wsUrl: string): UseVoiceStreamReturn {
   }, [status]);
 
   const stopRecording = useCallback(() => {
+    if (!isRecordingRef.current && !mediaRecorderRef.current) return;
+
+    // Release lock immediately to allow new recordings
+    // (cleanup code handles any stale recorders)
+    isRecordingRef.current = false;
+
     if (!mediaRecorderRef.current) return;
 
     const recorder = mediaRecorderRef.current;
@@ -575,6 +614,7 @@ export function useVoiceStream(wsUrl: string): UseVoiceStreamReturn {
   useEffect(() => {
     return () => {
       shouldReconnectRef.current = false;
+      isRecordingRef.current = false;
       
       if (wsRef.current) {
         wsRef.current.close();
