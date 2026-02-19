@@ -49,11 +49,20 @@ export class AudioQueue {
 
   /**
    * Call from a user gesture to unlock audio playback (Safari workaround).
+   * Also retries any audio that was queued while autoplay was blocked.
    */
   public warmUp(): void {
-    if (this.unlocked) return;
+    if (this.unlocked) {
+      // Already unlocked — but the queue may have items waiting from when autoplay
+      // was blocked (e.g. response arrived while tab was in background).
+      // Use this user gesture opportunity to start playback.
+      if (this.queue.length > 0 && !this._isPlaying && !this._isPaused) {
+        this.playNext();
+      }
+      return;
+    }
 
-    // Create and play a silent audio to unlock
+    // First time (or after autoplay rejection reset): unlock via silent audio
     const silentAudio = new Audio();
     silentAudio.src = 'data:audio/wav;base64,UklGRiQAAABXQVZFZm10IBAAAAABAAEARKwAAIhYAQACABAAZGF0YQAAAAA=';
     
@@ -196,13 +205,21 @@ export class AudioQueue {
           this.unlocked = true;
         })
         .catch(err => {
-          console.warn('Autoplay blocked:', err);
+          console.warn('Autoplay blocked or failed:', err);
           this._isPlaying = false;
           
-          // If not unlocked, keep item in queue for later
-          if (!this.unlocked) {
+          if (err.name === 'NotAllowedError') {
+            // Autoplay policy blocked playback (e.g. response arrived while tab was
+            // in background, or user hasn't interacted yet).
+            // Re-queue and reset unlock state so warmUp() on next user gesture retries.
+            console.log('Autoplay blocked (NotAllowedError) — re-queuing for next user gesture');
+            this.queue.unshift(url);
+            this.unlocked = false;
+          } else if (!this.unlocked) {
+            // Never been unlocked — keep in queue for warmUp()
             this.queue.unshift(url);
           } else if (this.onError) {
+            // Other error (e.g. network, bad URL) — skip and report
             this.onError(err, url);
           }
         });

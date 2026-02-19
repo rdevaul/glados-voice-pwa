@@ -70,6 +70,10 @@ export function useVoiceStream(wsUrl: string): UseVoiceStreamReturn {
   const isReconnectingRef = useRef(false);
   const pongReceivedRef = useRef(false);
   const pingTimeoutRef = useRef<ReturnType<typeof setTimeout> | null>(null);
+  // Track when we last received any message from the server (to avoid false-positive ping timeouts)
+  const lastMessageTimeRef = useRef<number>(Date.now());
+  // Track server_message IDs we've already processed (to deduplicate re-delivered pending messages)
+  const processedServerMsgIdsRef = useRef<Set<string>>(new Set());
 
   // Save session state for persistence
   const saveState = useCallback(() => {
@@ -108,7 +112,10 @@ export function useVoiceStream(wsUrl: string): UseVoiceStreamReturn {
   }, [wsUrl]);
 
   const connect = useCallback(() => {
-    if (wsRef.current?.readyState === WebSocket.OPEN) return;
+    // Guard against double-connect: don't create a new WebSocket if one is already
+    // OPEN or in the process of CONNECTING (readyState 0 or 1).
+    if (wsRef.current?.readyState === WebSocket.OPEN ||
+        wsRef.current?.readyState === WebSocket.CONNECTING) return;
     
     shouldReconnectRef.current = true;
     setError(null);
@@ -149,6 +156,8 @@ export function useVoiceStream(wsUrl: string): UseVoiceStreamReturn {
     };
 
     ws.onmessage = (event) => {
+      // Track liveness — used to skip unnecessary ping-timeout reconnects
+      lastMessageTimeRef.current = Date.now();
       try {
         const data = JSON.parse(event.data);
         
@@ -222,7 +231,11 @@ export function useVoiceStream(wsUrl: string): UseVoiceStreamReturn {
             setResponseMediaUrl(data.media_url || null);
             setProcessingStatus(null);  // Clear processing status on completion
             if (data.audio_url) {
-              setAudioQueue(prev => [...prev, data.audio_url]);
+              // Deduplicate: only add if this URL isn't already in the queue.
+              // Re-delivered pending messages may contain the same URL.
+              setAudioQueue(prev =>
+                prev.includes(data.audio_url) ? prev : [...prev, data.audio_url]
+              );
             }
             setStatus('ready');
             break;
@@ -236,16 +249,22 @@ export function useVoiceStream(wsUrl: string): UseVoiceStreamReturn {
             break;
             
           case 'server_message':
-            // Server-initiated message (follow-up, correction, proactive)
-            setServerMessages(prev => [...prev, {
-              message_id: data.message_id,
-              text: data.text,
-              audio_url: data.audio_url,
-              media_url: data.media_url,
-              reason: data.reason || 'follow_up',
-            }]);
-            if (data.audio_url) {
-              setAudioQueue(prev => [...prev, data.audio_url]);
+            // Server-initiated message (follow-up, correction, proactive).
+            // Deduplicate by message_id: re-delivered pending messages have the same ID.
+            if (!processedServerMsgIdsRef.current.has(data.message_id)) {
+              processedServerMsgIdsRef.current.add(data.message_id);
+              setServerMessages(prev => [...prev, {
+                message_id: data.message_id,
+                text: data.text,
+                audio_url: data.audio_url,
+                media_url: data.media_url,
+                reason: data.reason || 'follow_up',
+              }]);
+              if (data.audio_url) {
+                setAudioQueue(prev =>
+                  prev.includes(data.audio_url) ? prev : [...prev, data.audio_url]
+                );
+              }
             }
             break;
             
@@ -300,7 +319,8 @@ export function useVoiceStream(wsUrl: string): UseVoiceStreamReturn {
     };
   }, [wsUrl, buildWsUrl, saveState]);
 
-  // Helper to process incoming messages (used for pending messages on restore)
+  // Helper to process incoming messages (used for pending messages on restore).
+  // Must apply the same deduplication as the live ws.onmessage handler.
   const handleIncomingMessage = useCallback((msg: any) => {
     switch (msg.type) {
       case 'response_chunk':
@@ -310,19 +330,28 @@ export function useVoiceStream(wsUrl: string): UseVoiceStreamReturn {
         setResponseText(msg.text);
         setResponseComplete(true);
         if (msg.audio_url) {
-          setAudioQueue(prev => [...prev, msg.audio_url]);
+          // Deduplicate audio URL — re-delivered pending may repeat what was live-delivered
+          setAudioQueue(prev =>
+            prev.includes(msg.audio_url) ? prev : [...prev, msg.audio_url]
+          );
         }
         setStatus('ready');
         break;
       case 'server_message':
-        setServerMessages(prev => [...prev, {
-          message_id: msg.message_id,
-          text: msg.text,
-          audio_url: msg.audio_url,
-          reason: msg.reason || 'follow_up',
-        }]);
-        if (msg.audio_url) {
-          setAudioQueue(prev => [...prev, msg.audio_url]);
+        // Deduplicate by message_id
+        if (!processedServerMsgIdsRef.current.has(msg.message_id)) {
+          processedServerMsgIdsRef.current.add(msg.message_id);
+          setServerMessages(prev => [...prev, {
+            message_id: msg.message_id,
+            text: msg.text,
+            audio_url: msg.audio_url,
+            reason: msg.reason || 'follow_up',
+          }]);
+          if (msg.audio_url) {
+            setAudioQueue(prev =>
+              prev.includes(msg.audio_url) ? prev : [...prev, msg.audio_url]
+            );
+          }
         }
         break;
     }
@@ -584,10 +613,19 @@ export function useVoiceStream(wsUrl: string): UseVoiceStreamReturn {
           return;
         }
         
-        // Wait for pong - if no response in 3s, force reconnect
+        // Wait for pong - if no response in 10s, force reconnect.
+        // Use 10s (was 3s) to avoid killing a connection right when a response
+        // is arriving from the backend. Also bail early if we received data recently
+        // (progress updates count as liveness — backend can't pong while processing).
         pingTimeoutRef.current = setTimeout(() => {
           if (!pongReceivedRef.current && shouldReconnectRef.current) {
-            console.log('No pong received, connection stale - reconnecting...');
+            // If backend sent something in the last 15s, connection is alive
+            const timeSinceLastMsg = Date.now() - lastMessageTimeRef.current;
+            if (timeSinceLastMsg < 15000) {
+              console.log('Skipping reconnect — received data recently, connection is alive');
+              return;
+            }
+            console.log('No pong received and no recent data, connection stale - reconnecting...');
             // Force close the stale connection
             if (wsRef.current) {
               wsRef.current.close();
@@ -596,7 +634,7 @@ export function useVoiceStream(wsUrl: string): UseVoiceStreamReturn {
             setStatus('reconnecting');
             connect();
           }
-        }, 3000);
+        }, 10000);
       }
     };
 
