@@ -1,8 +1,12 @@
 import { useState, useEffect, useRef, useCallback } from 'react';
 import ReactMarkdown from 'react-markdown';
+import type { Components } from 'react-markdown';
+import remarkGfm from 'remark-gfm';
 import { useVoiceRecorder } from './hooks/useVoiceRecorder';
+import { useVoiceStream } from './hooks/useVoiceStream';
 import { PushToTalkButton } from './components/PushToTalkButton';
 import { chatWithText, chatWithAudio, getAudioUrl } from './api/voiceApi';
+import { getAudioQueue } from './utils/audioQueue';
 import './App.css';
 
 interface Message {
@@ -10,20 +14,106 @@ interface Message {
   role: 'user' | 'assistant';
   text: string;
   audioUrl?: string;
-  audioBlobUrl?: string; // For user recordings (temporary, not persisted)
+  audioBlobUrl?: string;
+  mediaUrl?: string;  // Images or video URLs
   timestamp: number;
   pending?: boolean;
+  streaming?: boolean;
 }
+
+// Helper to detect media type from URL
+function getMediaType(url: string): 'image' | 'video' | 'audio' | 'unknown' {
+  const lower = url.toLowerCase();
+  if (/\.(jpg|jpeg|png|gif|webp|svg)(\?|$)/.test(lower)) return 'image';
+  if (/\.(mp4|webm|mov|m4v)(\?|$)/.test(lower)) return 'video';
+  if (/\.(mp3|wav|ogg|m4a|aac|flac|opus)(\?|$)/.test(lower)) return 'audio';
+  // Check for common image/video hosting patterns
+  if (lower.includes('imgur.com') || lower.includes('i.redd.it')) return 'image';
+  if (lower.includes('youtube.com') || lower.includes('youtu.be')) return 'video';
+  return 'unknown';
+}
+
+// Custom ReactMarkdown components for media rendering
+const markdownComponents: Components = {
+  img: ({ src, alt }) => {
+    if (!src) return null;
+    const mediaType = getMediaType(src);
+    if (mediaType === 'video') {
+      return (
+        <video 
+          src={src} 
+          className="media-video"
+          controls
+          playsInline
+          preload="metadata"
+        />
+      );
+    }
+    return (
+      <img 
+        src={src} 
+        alt={alt || 'Image'} 
+        className="media-image"
+        loading="lazy"
+        onClick={() => window.open(src, '_blank')}
+      />
+    );
+  },
+  // Handle links that might be media files
+  a: ({ href, children }) => {
+    if (!href) return <>{children}</>;
+    const mediaType = getMediaType(href);
+    if (mediaType === 'image') {
+      return (
+        <img 
+          src={href} 
+          alt={String(children) || 'Image'} 
+          className="media-image"
+          loading="lazy"
+          onClick={() => window.open(href, '_blank')}
+        />
+      );
+    }
+    if (mediaType === 'video') {
+      return (
+        <video 
+          src={href} 
+          className="media-video"
+          controls
+          playsInline
+          preload="metadata"
+        />
+      );
+    }
+    if (mediaType === 'audio') {
+      return (
+        <audio 
+          src={href} 
+          className="media-audio"
+          controls
+          preload="metadata"
+        />
+      );
+    }
+    return <a href={href} target="_blank" rel="noopener noreferrer">{children}</a>;
+  },
+};
 
 const STORAGE_KEY = 'glados-voice-history';
 const MAX_STORED_MESSAGES = 50;
+
+// WebSocket URL for streaming mode
+const WS_URL = import.meta.env.VITE_WS_URL || 
+  `wss://${window.location.hostname}:8444/voice/stream`;
+
+// Feature flag for streaming mode
+const STREAMING_ENABLED = import.meta.env.VITE_STREAMING_ENABLED !== 'false';
 
 function loadMessages(): Message[] {
   try {
     const stored = localStorage.getItem(STORAGE_KEY);
     if (stored) {
-      // Filter out any pending messages that weren't completed
-      return JSON.parse(stored).filter((m: Message) => !m.pending);
+      return JSON.parse(stored).filter((m: Message) => !m.pending && !m.streaming);
     }
   } catch (e) {
     console.error('Failed to load messages:', e);
@@ -33,11 +123,10 @@ function loadMessages(): Message[] {
 
 function saveMessages(messages: Message[]) {
   try {
-    // Don't save audioBlobUrls (they're temporary) or pending messages
     const toStore = messages
-      .filter(m => !m.pending)
+      .filter(m => !m.pending && !m.streaming)
       .slice(-MAX_STORED_MESSAGES)
-      .map(({ audioBlobUrl, ...rest }) => rest);
+      .map(({ audioBlobUrl, streaming, ...rest }) => rest);
     localStorage.setItem(STORAGE_KEY, JSON.stringify(toStore));
   } catch (e) {
     console.error('Failed to save messages:', e);
@@ -49,29 +138,61 @@ function App() {
   const [textInput, setTextInput] = useState('');
   const [isProcessing, setIsProcessing] = useState(false);
   const [micPermission, setMicPermission] = useState<'prompt' | 'granted' | 'denied'>('prompt');
+  const [useStreaming, setUseStreaming] = useState(STREAMING_ENABLED);
   
   const messagesEndRef = useRef<HTMLDivElement>(null);
   const audioRef = useRef<HTMLAudioElement | null>(null);
   const processedBlobRef = useRef<Blob | null>(null);
   const abortControllerRef = useRef<AbortController | null>(null);
+  // Queue of assistant message IDs for async model - responses are matched in order
+  const assistantMsgQueueRef = useRef<string[]>([]);
+  const currentAssistantMsgRef = useRef<string | null>(null);
+  // Track last processed transcript/response to avoid duplicates
+  const lastProcessedTranscriptRef = useRef<string>('');
+  const lastProcessedResponseRef = useRef<string>('');
   
-  const { isRecording, startRecording, stopRecording, audioBlob, error } = useVoiceRecorder();
+  // Batch mode hooks
+  const { isRecording: batchIsRecording, startRecording: batchStartRecording, 
+          stopRecording: batchStopRecording, audioBlob, error: batchError } = useVoiceRecorder();
+  
+  // Streaming mode hooks
+  const stream = useVoiceStream(WS_URL);
+  const audioQueue = useRef(getAudioQueue());
 
-  // Save messages whenever they change (but not pending ones)
+  // Determine which mode we're using
+  const isRecording = useStreaming ? stream.status === 'recording' : batchIsRecording;
+  const error = useStreaming ? stream.error : batchError;
+  const isConnected = stream.status !== 'disconnected' && stream.status !== 'reconnecting';
+  const isReconnecting = stream.status === 'reconnecting';
+  // Async model: we no longer block on processing state
+  // const isStreamProcessing = stream.status === 'processing';
+
+  // Track if we've initiated connection to avoid loops
+  const connectionInitiated = useRef(false);
+  
+  // Connect to WebSocket on mount if streaming enabled
+  useEffect(() => {
+    if (useStreaming && !connectionInitiated.current) {
+      connectionInitiated.current = true;
+      console.log('Initiating WebSocket connection...');
+      stream.connect();
+    }
+    // No cleanup - let the hook handle its own WebSocket lifecycle
+  }, [useStreaming, stream.connect]);
+
+  // Save messages whenever they change
   useEffect(() => {
     saveMessages(messages);
   }, [messages]);
 
-  // Check/request mic permission on mount
+  // Check mic permission on mount
   useEffect(() => {
     navigator.permissions?.query({ name: 'microphone' as PermissionName })
       .then(result => {
         setMicPermission(result.state as 'prompt' | 'granted' | 'denied');
         result.onchange = () => setMicPermission(result.state as 'prompt' | 'granted' | 'denied');
       })
-      .catch(() => {
-        setMicPermission('prompt');
-      });
+      .catch(() => setMicPermission('prompt'));
   }, []);
 
   // Scroll to bottom on new messages
@@ -79,15 +200,192 @@ function App() {
     messagesEndRef.current?.scrollIntoView({ behavior: 'smooth' });
   }, [messages]);
 
-  // Handle audio blob when recording completes
+  // Handle streaming transcript updates
   useEffect(() => {
-    if (audioBlob && !isRecording && audioBlob !== processedBlobRef.current) {
-      processedBlobRef.current = audioBlob;
-      handleAudioSubmit(audioBlob);
+    if (!useStreaming) return;
+    
+    if (stream.finalTranscript && stream.finalTranscript !== lastProcessedTranscriptRef.current) {
+      // Mark as processed to avoid duplicates on re-render
+      lastProcessedTranscriptRef.current = stream.finalTranscript;
+      
+      // Update user message with final transcript AND create assistant placeholder
+      const assistantId = crypto.randomUUID();
+      
+      setMessages(prev => {
+        // Only update the FIRST pending user message (not all of them!)
+        let foundPending = false;
+        const updated = prev.map(m => {
+          if (!foundPending && m.pending && m.role === 'user') {
+            foundPending = true;
+            return { ...m, text: stream.finalTranscript, pending: false };
+          }
+          return m;
+        });
+        
+        // Always create a new assistant placeholder for each transcript
+        return [...updated, {
+          id: assistantId,
+          role: 'assistant' as const,
+          text: '⏳ Thinking...',
+          timestamp: Date.now(),
+          streaming: true,
+        }];
+      });
+      
+      // Add to queue - responses will be matched in order
+      assistantMsgQueueRef.current.push(assistantId);
+      // Set current for backward compat with response handler
+      if (!currentAssistantMsgRef.current) {
+        currentAssistantMsgRef.current = assistantId;
+      }
+    } else if (stream.partialTranscript) {
+      // Update only the FIRST pending user message with partial transcript
+      setMessages(prev => {
+        let foundPending = false;
+        return prev.map(m => {
+          if (!foundPending && m.pending && m.role === 'user') {
+            foundPending = true;
+            return { ...m, text: `🎤 ${stream.partialTranscript}` };
+          }
+          return m;
+        });
+      });
     }
-  }, [audioBlob, isRecording]);
+  }, [stream.partialTranscript, stream.finalTranscript, useStreaming]);
 
-  // Cleanup abort controller on unmount
+  // Handle streaming response updates (including processing status)
+  useEffect(() => {
+    if (!useStreaming) return;
+    
+    const msgId = currentAssistantMsgRef.current;
+    
+    // Show processing status while waiting for response
+    if (stream.processingStatus && msgId && !stream.responseText) {
+      setMessages(prev => prev.map(m => 
+        m.id === msgId
+          ? { 
+              ...m, 
+              text: `⏳ ${stream.processingStatus?.message ?? 'Processing...'}`,
+              streaming: true,
+            }
+          : m
+      ));
+    }
+    
+    if (stream.responseText) {
+      // Skip if we already processed this exact response (avoid duplicates)
+      if (stream.responseComplete && stream.responseText === lastProcessedResponseRef.current) {
+        return;
+      }
+      
+      const latestAudioUrl = stream.audioQueue.length > 0 
+        ? getAudioUrl(stream.audioQueue[stream.audioQueue.length - 1])
+        : undefined;
+      
+      if (msgId) {
+        // Update existing assistant message with streaming text
+        setMessages(prev => prev.map(m => 
+          m.id === msgId
+            ? { 
+                ...m, 
+                text: stream.responseText, 
+                streaming: !stream.responseComplete,
+                audioUrl: stream.responseComplete ? latestAudioUrl : m.audioUrl,
+                mediaUrl: stream.responseComplete ? (stream.responseMediaUrl || m.mediaUrl) : m.mediaUrl
+              }
+            : m
+        ));
+      } else if (stream.responseComplete) {
+        // No existing message (e.g., restored session) - create a new one
+        const newId = `${Date.now()}-${Math.random()}`;
+        setMessages(prev => [...prev, {
+          id: newId,
+          role: 'assistant',
+          text: stream.responseText,
+          audioUrl: latestAudioUrl,
+          mediaUrl: stream.responseMediaUrl || undefined,
+          timestamp: Date.now(),
+          pending: false,
+          streaming: false,
+        }]);
+      }
+      
+      // Clear state when complete and advance to next queued message
+      if (stream.responseComplete) {
+        // Mark as processed to avoid duplicates
+        lastProcessedResponseRef.current = stream.responseText;
+        setIsProcessing(false);
+        // Remove completed message from queue and set next one as current
+        assistantMsgQueueRef.current.shift();
+        currentAssistantMsgRef.current = assistantMsgQueueRef.current[0] || null;
+      }
+    }
+  }, [stream.responseText, stream.responseComplete, stream.responseMediaUrl, stream.audioQueue, stream.processingStatus, useStreaming]);
+
+  // Handle server messages (additional messages from agent)
+  const lastServerMsgCountRef = useRef(0);
+  
+  useEffect(() => {
+    if (!useStreaming) return;
+    
+    // Only process new server messages
+    const newMessages = stream.serverMessages.slice(lastServerMsgCountRef.current);
+    lastServerMsgCountRef.current = stream.serverMessages.length;
+    
+    if (newMessages.length === 0) return;
+    
+    // Add each new server message as an assistant message
+    newMessages.forEach(serverMsg => {
+      const audioUrl = serverMsg.audio_url ? getAudioUrl(serverMsg.audio_url) : undefined;
+      
+      setMessages(prev => [...prev, {
+        id: serverMsg.message_id,
+        role: 'assistant',
+        text: serverMsg.text,
+        audioUrl,
+        mediaUrl: serverMsg.media_url,
+        timestamp: Date.now(),
+        pending: false,
+        streaming: false,
+      }]);
+      
+      console.log('Added server message:', serverMsg.message_id, serverMsg.reason);
+    });
+    
+  }, [stream.serverMessages, useStreaming]);
+
+  // Handle audio queue for streaming responses
+  const lastAudioIndexRef = useRef(0);
+  const lastAudioQueueLengthRef = useRef(0);
+  
+  useEffect(() => {
+    if (!useStreaming) return;
+    
+    // Detect if queue was cleared (length went to 0 or decreased significantly)
+    if (stream.audioQueue.length === 0 || stream.audioQueue.length < lastAudioQueueLengthRef.current) {
+      lastAudioIndexRef.current = 0;
+    }
+    lastAudioQueueLengthRef.current = stream.audioQueue.length;
+    
+    // Only process new audio URLs (avoid re-adding on every render)
+    const newUrls = stream.audioQueue.slice(lastAudioIndexRef.current);
+    newUrls.forEach(url => {
+      const fullUrl = getAudioUrl(url);
+      console.log('Enqueueing audio:', fullUrl);
+      audioQueue.current.enqueue(fullUrl);
+    });
+    lastAudioIndexRef.current = stream.audioQueue.length;
+  }, [stream.audioQueue, useStreaming]);
+
+  // Handle batch mode audio blob
+  useEffect(() => {
+    if (!useStreaming && audioBlob && !batchIsRecording && audioBlob !== processedBlobRef.current) {
+      processedBlobRef.current = audioBlob;
+      handleBatchAudioSubmit(audioBlob);
+    }
+  }, [audioBlob, batchIsRecording, useStreaming]);
+
+  // Cleanup on unmount
   useEffect(() => {
     return () => {
       abortControllerRef.current?.abort();
@@ -113,6 +411,9 @@ function App() {
   const playAudio = useCallback((url: string) => {
     if (!url) return;
     
+    // Warm up audio queue on first interaction
+    audioQueue.current.warmUp();
+    
     if (audioRef.current) {
       audioRef.current.pause();
       audioRef.current.src = url;
@@ -120,32 +421,61 @@ function App() {
       audioRef.current = new Audio(url);
     }
     
-    const audio = audioRef.current;
-    audio.load();
-    
-    const playPromise = audio.play();
-    if (playPromise) {
-      playPromise.catch(err => {
-        console.log('Autoplay blocked:', err);
-      });
-    }
+    audioRef.current.play().catch(err => console.log('Autoplay blocked:', err));
   }, []);
 
-  const handleAudioSubmit = async (blob: Blob) => {
+  // Streaming mode handlers
+  const handleStreamingStart = async () => {
+    // Async model: allow starting recording anytime (except while already recording)
+    if (stream.status === 'recording') return;
+    
+    // Don't clear previous responses - let them accumulate
+    // Don't set isProcessing - async model doesn't block
+    
+    // Add pending user message (will be updated with transcript)
+    addMessage('user', '🎤 Recording...', { pending: true });
+    
+    // Don't add assistant placeholder yet - wait for transcript to be confirmed
+    // This prevents the "lost response" bug when multiple recordings overlap
+    currentAssistantMsgRef.current = null;
+    
+    await stream.startRecording();
+  };
+
+  const handleStreamingStop = () => {
+    stream.stopRecording();
+  };
+
+  const handleStreamingTextSubmit = (e: React.FormEvent) => {
+    e.preventDefault();
+    // Async model: allow sending anytime except while recording
+    if (!textInput.trim() || stream.status === 'recording') return;
+
+    const text = textInput.trim();
+    setTextInput('');
+    // Don't set isProcessing or clear response - async model
+    
+    // Add user message
+    addMessage('user', text);
+    
+    // Add placeholder assistant message
+    const assistantId = addMessage('assistant', '...', { streaming: true });
+    currentAssistantMsgRef.current = assistantId;
+    
+    stream.sendText(text);
+  };
+
+  // Batch mode handlers (existing logic)
+  const handleBatchAudioSubmit = async (blob: Blob) => {
     if (isProcessing) return;
     
     setIsProcessing(true);
-    
-    // Create a temporary URL for the user's recording
     const userAudioUrl = URL.createObjectURL(blob);
-    
-    // Add user message with pending transcript
     const userMsgId = addMessage('user', '🎤 Transcribing...', {
       audioBlobUrl: userAudioUrl,
       pending: true,
     });
     
-    // Cancel any existing request
     abortControllerRef.current?.abort();
     abortControllerRef.current = new AbortController();
     
@@ -153,39 +483,28 @@ function App() {
       const response = await chatWithAudio(blob);
       const audioUrl = getAudioUrl(response.audio_url);
       
-      // Update user message with transcript
-      const transcript = response.user_text || '🎤 [Voice message]';
       updateMessage(userMsgId, { 
-        text: transcript, 
+        text: response.user_text || '🎤 [Voice message]', 
         pending: false 
       });
       
-      // Add assistant response
       addMessage('assistant', response.text, { audioUrl });
       playAudio(audioUrl);
     } catch (err) {
-      if (err instanceof Error && err.name === 'AbortError') {
-        // Request was cancelled, don't show error
-        return;
-      }
+      if (err instanceof Error && err.name === 'AbortError') return;
       
-      const errorMsg = err instanceof Error ? err.message : 'Unknown error';
-      
-      // Update user message to show it was sent
       updateMessage(userMsgId, { 
         text: '🎤 [Voice message - transcript unavailable]', 
         pending: false 
       });
-      
-      // Add error message with retry option
-      addMessage('assistant', `Error: ${errorMsg}. Tap to retry or send another message.`);
+      addMessage('assistant', `Error: ${err instanceof Error ? err.message : 'Unknown error'}`);
     } finally {
       setIsProcessing(false);
       abortControllerRef.current = null;
     }
   };
 
-  const handleTextSubmit = async (e: React.FormEvent) => {
+  const handleBatchTextSubmit = async (e: React.FormEvent) => {
     e.preventDefault();
     if (!textInput.trim() || isProcessing) return;
 
@@ -206,9 +525,7 @@ function App() {
       addMessage('assistant', response.text, { audioUrl });
       playAudio(audioUrl);
     } catch (err) {
-      if (err instanceof Error && err.name === 'AbortError') {
-        return;
-      }
+      if (err instanceof Error && err.name === 'AbortError') return;
       
       updateMessage(userMsgId, { pending: false });
       addMessage('assistant', `Error: ${err instanceof Error ? err.message : 'Unknown error'}`);
@@ -229,12 +546,29 @@ function App() {
   };
 
   const handleStartRecording = () => {
+    // Warm up audio on user gesture
+    audioQueue.current.warmUp();
+    
     if (micPermission === 'prompt') {
       requestMicPermission();
     } else if (micPermission === 'granted') {
-      startRecording();
+      if (useStreaming) {
+        handleStreamingStart();
+      } else {
+        batchStartRecording();
+      }
     }
   };
+
+  const handleStopRecording = () => {
+    if (useStreaming) {
+      handleStreamingStop();
+    } else {
+      batchStopRecording();
+    }
+  };
+
+  const handleTextSubmit = useStreaming ? handleStreamingTextSubmit : handleBatchTextSubmit;
 
   const clearHistory = () => {
     if (confirm('Clear conversation history?')) {
@@ -243,21 +577,57 @@ function App() {
     }
   };
 
+  const toggleStreamingMode = () => {
+    if (useStreaming) {
+      stream.disconnect();
+    }
+    setUseStreaming(!useStreaming);
+  };
+
+  // Connection status indicator
+  const getStatusIcon = () => {
+    if (!useStreaming) return '📡'; // Batch mode
+    switch (stream.status) {
+      case 'disconnected': return '🔴';
+      case 'connecting': return '🟡';
+      case 'reconnecting': return '🟠'; // Reconnecting after app switch
+      case 'ready': return '🟢';
+      case 'recording': return '🔴';
+      case 'processing': return '🔵';
+      default: return '⚪';
+    }
+  };
+
   return (
     <div className="app">
       <header className="header">
         <h1>🎂 GLaDOS</h1>
-        {messages.length > 0 && (
-          <button className="clear-button" onClick={clearHistory} title="Clear history">
-            🗑️
+        <div className="header-controls">
+          <button 
+            className="status-button" 
+            onClick={toggleStreamingMode}
+            title={useStreaming ? `Streaming: ${stream.status}` : 'Batch mode'}
+          >
+            {getStatusIcon()}
           </button>
-        )}
+          {messages.length > 0 && (
+            <button className="clear-button" onClick={clearHistory} title="Clear history">
+              🗑️
+            </button>
+          )}
+        </div>
       </header>
 
       <main className="messages">
         {messages.length === 0 && (
           <div className="empty-state">
-            {micPermission === 'prompt' ? (
+            {!useStreaming ? (
+              <>Batch mode. Tap status icon to switch to streaming.</>
+            ) : isReconnecting ? (
+              <>🔄 Reconnecting...</>
+            ) : !isConnected ? (
+              <>Connecting to voice server...</>
+            ) : micPermission === 'prompt' ? (
               <>Tap the mic button to enable voice, or type below.</>
             ) : micPermission === 'denied' ? (
               <>Mic access denied. Use text input below.</>
@@ -267,33 +637,62 @@ function App() {
           </div>
         )}
         {messages.map(msg => (
-          <div key={msg.id} className={`message ${msg.role} ${msg.pending ? 'pending' : ''}`}>
+          <div key={msg.id} className={`message ${msg.role} ${msg.pending ? 'pending' : ''} ${msg.streaming ? 'streaming' : ''}`}>
             <div className="message-text">
               {msg.role === 'assistant' ? (
-                <ReactMarkdown>{msg.text}</ReactMarkdown>
+                <ReactMarkdown remarkPlugins={[remarkGfm]} components={markdownComponents}>{msg.text}</ReactMarkdown>
               ) : (
                 msg.text
               )}
+              {msg.streaming && <span className="typing-indicator">▋</span>}
             </div>
+            {msg.mediaUrl && (
+              <div className="message-media">
+                {getMediaType(msg.mediaUrl) === 'image' ? (
+                  <img 
+                    src={msg.mediaUrl} 
+                    alt="Response media" 
+                    className="media-image"
+                    loading="lazy"
+                    onClick={() => window.open(msg.mediaUrl, '_blank')}
+                  />
+                ) : getMediaType(msg.mediaUrl) === 'video' ? (
+                  <video 
+                    src={msg.mediaUrl} 
+                    className="media-video"
+                    controls
+                    playsInline
+                    preload="metadata"
+                  />
+                ) : getMediaType(msg.mediaUrl) === 'audio' ? (
+                  <audio 
+                    src={msg.mediaUrl} 
+                    className="media-audio"
+                    controls
+                    preload="metadata"
+                  />
+                ) : (
+                  <a href={msg.mediaUrl} target="_blank" rel="noopener noreferrer" className="media-link">
+                    📎 View attachment
+                  </a>
+                )}
+              </div>
+            )}
             <div className="message-actions">
-              {/* User voice message playback */}
               {msg.audioBlobUrl && (
                 <button 
                   className="play-button"
                   onClick={() => playAudio(msg.audioBlobUrl!)}
                   aria-label="Play your recording"
-                  title="Play your recording"
                 >
                   🎤
                 </button>
               )}
-              {/* Assistant audio playback */}
               {msg.audioUrl && (
                 <button 
                   className="play-button"
                   onClick={() => playAudio(msg.audioUrl!)}
                   aria-label="Play response"
-                  title="Play response"
                 >
                   🔊
                 </button>
@@ -310,8 +709,8 @@ function App() {
         <PushToTalkButton
           isRecording={isRecording}
           onStartRecording={handleStartRecording}
-          onStopRecording={stopRecording}
-          disabled={isProcessing || micPermission === 'denied'}
+          onStopRecording={handleStopRecording}
+          disabled={isRecording || micPermission === 'denied' || (useStreaming && !isConnected)}
         />
         
         <form className="text-input-form" onSubmit={handleTextSubmit}>
@@ -320,9 +719,12 @@ function App() {
             value={textInput}
             onChange={(e) => setTextInput(e.target.value)}
             placeholder="Or type here..."
-            disabled={isProcessing}
+            disabled={(useStreaming ? isRecording : isProcessing) || (useStreaming && !isConnected)}
           />
-          <button type="submit" disabled={isProcessing || !textInput.trim()}>
+          <button 
+            type="submit" 
+            disabled={(useStreaming ? isRecording : isProcessing) || !textInput.trim() || (useStreaming && !isConnected)}
+          >
             Send
           </button>
         </form>

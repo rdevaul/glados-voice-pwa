@@ -35,9 +35,28 @@ body {
   font-weight: 600;
 }
 
-.clear-button {
+.header-controls {
   position: absolute;
   right: 16px;
+  display: flex;
+  align-items: center;
+  gap: 8px;
+}
+
+.status-button {
+  background: none;
+  border: none;
+  font-size: 16px;
+  cursor: pointer;
+  padding: 8px;
+  opacity: 0.8;
+}
+
+.status-button:hover {
+  opacity: 1;
+}
+
+.clear-button {
   background: none;
   border: none;
   font-size: 18px;
@@ -70,8 +89,12 @@ body {
   padding: 12px 16px;
   border-radius: 16px;
   display: flex;
-  align-items: center;
+  flex-direction: column;
   gap: 8px;
+}
+
+.message .message-actions {
+  align-self: flex-end;
 }
 
 .message.user {
@@ -90,6 +113,21 @@ body {
 .message-text {
   flex: 1;
   overflow-wrap: break-word;
+}
+
+.message.streaming .message-text {
+  color: #94a3b8;
+}
+
+.typing-indicator {
+  display: inline-block;
+  animation: blink 1s infinite;
+  color: #3b82f6;
+}
+
+@keyframes blink {
+  0%, 50% { opacity: 1; }
+  51%, 100% { opacity: 0; }
 }
 
 .message.pending {
@@ -165,6 +203,53 @@ body {
   color: #94a3b8;
 }
 
+/* Media styling for images and videos */
+.message-media {
+  margin: 8px 0;
+  max-width: 100%;
+}
+
+.media-image {
+  max-width: 100%;
+  max-height: 300px;
+  border-radius: 8px;
+  cursor: pointer;
+  object-fit: contain;
+  background: rgba(0, 0, 0, 0.2);
+}
+
+.media-image:hover {
+  opacity: 0.9;
+}
+
+.media-video {
+  max-width: 100%;
+  max-height: 300px;
+  border-radius: 8px;
+  background: #000;
+}
+
+.media-audio {
+  width: 100%;
+  max-width: 400px;
+  border-radius: 8px;
+  background: rgba(0, 0, 0, 0.3);
+}
+
+.media-link {
+  display: inline-block;
+  padding: 8px 12px;
+  background: rgba(59, 130, 246, 0.2);
+  border-radius: 8px;
+  color: #3b82f6;
+  text-decoration: none;
+  font-size: 14px;
+}
+
+.media-link:hover {
+  background: rgba(59, 130, 246, 0.3);
+}
+
 .play-button {
   background: none;
   border: none;
@@ -237,4 +322,33 @@ body {
   .controls {
     padding-bottom: calc(20px + env(safe-area-inset-bottom));
   }
+}
+
+/* Markdown table styling */
+.message table {
+  border-collapse: collapse;
+  margin: 8px 0;
+  font-size: 14px;
+  width: 100%;
+  overflow-x: auto;
+  display: block;
+}
+
+.message th, .message td {
+  border: 1px solid #4b5563;
+  padding: 6px 10px;
+  text-align: left;
+}
+
+.message th {
+  background: rgba(255, 255, 255, 0.1);
+  font-weight: 600;
+}
+
+.message.assistant th {
+  background: rgba(0, 0, 0, 0.2);
+}
+
+.message tr:nth-child(even) {
+  background: rgba(255, 255, 255, 0.05);
 }

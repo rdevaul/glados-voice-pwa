@@ -4,8 +4,9 @@ FastAPI server providing STT (Whisper) and TTS (Piper) endpoints.
 """
 
 from fastapi import FastAPI, File, UploadFile, HTTPException
-from fastapi.responses import JSONResponse, FileResponse
+from fastapi.responses import JSONResponse, FileResponse, HTMLResponse
 from fastapi.middleware.cors import CORSMiddleware
+from fastapi.staticfiles import StaticFiles
 from pydantic import BaseModel
 import subprocess
 import os
@@ -13,7 +14,13 @@ import uuid
 from pathlib import Path
 from typing import Optional
 
-app = FastAPI(title="GLaDOS Voice API", version="0.1.0")
+from .utils import strip_markdown
+
+app = FastAPI(title="GLaDOS Voice API", version="0.2.0-streaming")
+
+# Register WebSocket routes for streaming
+from .websocket import register_websocket_routes
+register_websocket_routes(app)
 
 # Enable CORS for PWA access
 app.add_middleware(
@@ -27,6 +34,19 @@ app.add_middleware(
 # Directory setup
 AUDIO_CACHE_DIR = Path("audio_cache")
 AUDIO_CACHE_DIR.mkdir(exist_ok=True)
+
+# Static files directory (for test page)
+STATIC_DIR = Path(__file__).parent.parent / "static"
+STATIC_DIR.mkdir(exist_ok=True)
+
+
+@app.get("/test", response_class=HTMLResponse)
+async def test_page():
+    """Serve the WebSocket test page."""
+    test_file = STATIC_DIR / "test.html"
+    if test_file.exists():
+        return HTMLResponse(content=test_file.read_text())
+    return HTMLResponse(content="<h1>Test page not found</h1>", status_code=404)
 
 # External command templates
 WHISPER_CMD = "whisper {input_file} --model base --output_format txt --output_dir {output_dir}"
@@ -112,8 +132,10 @@ async def speak(request: SpeakRequest):
     audio_id = uuid.uuid4().hex
     output_file_path = AUDIO_CACHE_DIR / f"{audio_id}.wav"
     
-    # Escape quotes in text for shell
-    safe_text = request.text.replace('"', '\\"').replace("'", "'\\''")
+    # Strip markdown and escape for shell (double-quoted context)
+    clean_text = strip_markdown(request.text)
+    # In double quotes, only need to escape: backslashes, double quotes, backticks, and $
+    safe_text = clean_text.replace('\\', '\\\\').replace('"', '\\"').replace('`', '\\`').replace('$', '\\$')
     
     piper_command = PIPER_CMD.format(
         text=safe_text,
@@ -246,11 +268,13 @@ async def _process_chat(user_text: str):
         print(f"[VOICE] Exception: {e}")
         response_text = f"I heard: {user_text}. Error: {str(e)}"
     
-    # Generate TTS for response
+    # Generate TTS for response - strip markdown for cleaner speech
     audio_id = uuid.uuid4().hex
     output_file_path = AUDIO_CACHE_DIR / f"{audio_id}.wav"
     
-    safe_text = response_text.replace('"', '\\"').replace("'", "'\\''")
+    clean_text = strip_markdown(response_text)
+    # In double quotes, only need to escape: backslashes, double quotes, backticks, and $
+    safe_text = clean_text.replace('\\', '\\\\').replace('"', '\\"').replace('`', '\\`').replace('$', '\\$')
     piper_command = PIPER_CMD.format(
         text=safe_text,
         output_file=output_file_path
@@ -274,7 +298,45 @@ async def serve_audio(filename: str):
     if not file_path.exists():
         raise HTTPException(status_code=404, detail="File not found")
 
-    return FileResponse(file_path, media_type="audio/wav")
+    # Detect media type from extension
+    ext = file_path.suffix.lower()
+    media_type = MEDIA_TYPES.get(ext, "audio/wav")
+    
+    return FileResponse(file_path, media_type=media_type)
+
+
+# Media type mapping for serving images/videos
+MEDIA_TYPES = {
+    ".png": "image/png",
+    ".jpg": "image/jpeg",
+    ".jpeg": "image/jpeg",
+    ".gif": "image/gif",
+    ".webp": "image/webp",
+    ".svg": "image/svg+xml",
+    ".mp4": "video/mp4",
+    ".webm": "video/webm",
+    ".mov": "video/quicktime",
+    ".wav": "audio/wav",
+    ".mp3": "audio/mpeg",
+    ".ogg": "audio/ogg",
+}
+
+
+@app.get("/voice/media/{filename}")
+async def serve_media(filename: str):
+    """Serve media files (images, videos, audio) with correct MIME types."""
+    # Sanitize filename to prevent directory traversal
+    safe_filename = Path(filename).name
+    file_path = AUDIO_CACHE_DIR / safe_filename
+    
+    if not file_path.exists():
+        raise HTTPException(status_code=404, detail="File not found")
+    
+    # Detect media type from extension
+    ext = file_path.suffix.lower()
+    media_type = MEDIA_TYPES.get(ext, "application/octet-stream")
+    
+    return FileResponse(file_path, media_type=media_type)
 
 
 if __name__ == "__main__":
