@@ -39,6 +39,20 @@ export async function chatWithAudio(audioBlob: Blob): Promise<ChatResponse> {
 export function getAudioUrl(path: string): string {
   // If path is already a full URL, return as-is
   if (path.startsWith('http')) return path;
-  // Otherwise, prepend the API base
-  return `${API_BASE}${path}`;
+  
+  // If VITE_API_URL is explicitly set, use it
+  if (import.meta.env.VITE_API_URL) {
+    return `${import.meta.env.VITE_API_URL}${path}`;
+  }
+  
+  // Auto-detect: if accessed from a non-localhost host, assume API is on port 8444
+  // This handles Tailscale (glados.tailad67af.ts.net), LAN, etc.
+  if (typeof window !== 'undefined' && window.location.hostname !== 'localhost') {
+    const proto = window.location.protocol;
+    const host = window.location.hostname;
+    return `${proto}//${host}:8444${path}`;
+  }
+  
+  // Local dev fallback
+  return `http://localhost:8100${path}`;
 }
