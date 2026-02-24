@@ -35,9 +35,16 @@ app.add_middleware(
 AUDIO_CACHE_DIR = Path("audio_cache")
 AUDIO_CACHE_DIR.mkdir(exist_ok=True)
 
+MEDIA_CACHE_DIR = Path("media_cache")
+MEDIA_CACHE_DIR.mkdir(exist_ok=True)
+
 # Static files directory (for test page)
 STATIC_DIR = Path(__file__).parent.parent / "static"
 STATIC_DIR.mkdir(exist_ok=True)
+
+
+# Serve media files (images, etc.) at /media — accessible from the phone
+app.mount("/media", StaticFiles(directory=str(MEDIA_CACHE_DIR)), name="media")
 
 
 @app.get("/test", response_class=HTMLResponse)
@@ -327,7 +334,7 @@ async def serve_media(filename: str):
     """Serve media files (images, videos, audio) with correct MIME types."""
     # Sanitize filename to prevent directory traversal
     safe_filename = Path(filename).name
-    file_path = AUDIO_CACHE_DIR / safe_filename
+    file_path = MEDIA_CACHE_DIR / safe_filename
     
     if not file_path.exists():
         raise HTTPException(status_code=404, detail="File not found")
