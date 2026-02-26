@@ -70,6 +70,8 @@ export function useVoiceStream(wsUrl: string): UseVoiceStreamReturn {
   const isReconnectingRef = useRef(false);
   const pongReceivedRef = useRef(false);
   const pingTimeoutRef = useRef<ReturnType<typeof setTimeout> | null>(null);
+  // Screen Wake Lock — prevents iOS from suspending the app during recording
+  const wakeLockRef = useRef<WakeLockSentinel | null>(null);
   // Track when we last received any message from the server (to avoid false-positive ping timeouts)
   const lastMessageTimeRef = useRef<number>(Date.now());
   // Track server_message IDs we've already processed (to deduplicate re-delivered pending messages)
@@ -424,6 +426,17 @@ export function useVoiceStream(wsUrl: string): UseVoiceStreamReturn {
       });
       streamRef.current = stream;
 
+      // Request Screen Wake Lock — keeps screen on so iOS/Android don't
+      // suspend the WebView and cut off recording mid-message.
+      if ('wakeLock' in navigator) {
+        try {
+          wakeLockRef.current = await (navigator as any).wakeLock.request('screen');
+          console.log('Wake lock acquired');
+        } catch (wl) {
+          console.warn('Wake lock not available:', wl);
+        }
+      }
+
       // Determine best supported format
       let mimeType = 'audio/webm';
       if (MediaRecorder.isTypeSupported('audio/webm;codecs=opus')) {
@@ -473,6 +486,12 @@ export function useVoiceStream(wsUrl: string): UseVoiceStreamReturn {
 
   const stopRecording = useCallback(() => {
     if (!isRecordingRef.current && !mediaRecorderRef.current) return;
+
+    // Release Screen Wake Lock
+    if (wakeLockRef.current) {
+      wakeLockRef.current.release().catch(() => {});
+      wakeLockRef.current = null;
+    }
 
     // Release lock immediately to allow new recordings
     // (cleanup code handles any stale recorders)

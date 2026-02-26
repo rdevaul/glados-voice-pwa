@@ -73,7 +73,27 @@ def get_openai_client():
 from pydantic import BaseModel, Field
 from starlette.websockets import WebSocketState
 
-from .transcribe import ChunkedTranscriber
+from .transcribe import ChunkedTranscriber, VoxtralTranscriber
+
+# STT backend selection: "whisper" (default) or "voxtral"
+STT_BACKEND = os.environ.get("STT_BACKEND", "whisper").lower()
+VOXTRAL_SERVER_URL = os.environ.get("VOXTRAL_SERVER_URL", "http://localhost:8300")
+VOXTRAL_MODEL = os.environ.get("VOXTRAL_MODEL", "mlx-community/Voxtral-Mini-4B-Realtime-6bit")
+
+
+def make_transcriber(audio_format: Optional[str] = None) -> ChunkedTranscriber:
+    """Instantiate the configured STT transcriber."""
+    if STT_BACKEND == "voxtral":
+        t = VoxtralTranscriber(
+            server_url=VOXTRAL_SERVER_URL,
+            model=VOXTRAL_MODEL,
+            fallback=True,
+        )
+    else:
+        t = ChunkedTranscriber(chunk_duration_ms=3000, overlap_ms=500, model="base")
+    if audio_format:
+        t.set_format(audio_format)
+    return t
 from .stream_response import stream_chat_response, get_all_responses, get_all_responses_with_progress
 from .utils import strip_markdown
 from .session_store import session_store, start_cleanup_task, Session
@@ -226,15 +246,9 @@ class WebSocketManager:
             session = await session_store.get_session(session_id)
         
         self.active_connections[session_id] = websocket
-        self.transcribers[session_id] = ChunkedTranscriber(
-            chunk_duration_ms=3000,
-            overlap_ms=500,
-            model="base"
+        self.transcribers[session_id] = make_transcriber(
+            audio_format=session.audio_format if session else None
         )
-        
-        # If restoring, configure transcriber with saved format
-        if session and session.audio_format:
-            self.transcribers[session_id].set_format(session.audio_format)
         
         # Check for pending messages (indicates a restore with queued data)
         pending = await session_store.get_pending_messages(session_id)
@@ -275,13 +289,9 @@ class WebSocketManager:
         
         # Restore transcriber
         if session_id not in self.transcribers:
-            self.transcribers[session_id] = ChunkedTranscriber(
-                chunk_duration_ms=3000,
-                overlap_ms=500,
-                model="base"
+            self.transcribers[session_id] = make_transcriber(
+                audio_format=session.audio_format if session else None
             )
-            if session.audio_format:
-                self.transcribers[session_id].set_format(session.audio_format)
         
         # Get pending messages
         pending = await session_store.get_pending_messages(session_id)
@@ -450,8 +460,7 @@ class WebSocketManager:
         # Get or create transcriber
         transcriber = self.transcribers.get(session_id)
         if not transcriber:
-            transcriber = ChunkedTranscriber()
-            transcriber.set_format(audio_format)
+            transcriber = make_transcriber(audio_format=audio_format)
             self.transcribers[session_id] = transcriber
         
         # Send partial transcript notification
@@ -460,12 +469,38 @@ class WebSocketManager:
             session_id
         )
         await session_store.update_session(session_id, partial_transcript="Transcribing...")
-        
-        # Feed all buffered audio to transcriber and finalize
-        logger.info(f"Setting transcriber buffer with {len(audio_data)} bytes")
-        transcriber.audio_buffer = bytearray(audio_data)
-        logger.info(f"Transcriber buffer size: {len(transcriber.audio_buffer)} bytes")
-        transcript = await transcriber.finalize()
+
+        # Keepalive during transcription — prevents PWA from closing the WebSocket
+        # while waiting for Voxtral model load / Whisper processing
+        _keepalive_msgs = [
+            "Transcribing...",
+            "Still transcribing...",
+            "Processing audio...",
+            "Almost done transcribing...",
+        ]
+        async def _transcription_keepalive():
+            count = 0
+            while True:
+                await asyncio.sleep(5)
+                msg = _keepalive_msgs[min(count, len(_keepalive_msgs) - 1)]
+                await self.send_message(
+                    PartialTranscriptMessage(text=msg, is_final=False), session_id
+                )
+                count += 1
+
+        _keepalive_task = asyncio.create_task(_transcription_keepalive())
+        try:
+            # Feed all buffered audio to transcriber and finalize
+            logger.info(f"Setting transcriber buffer with {len(audio_data)} bytes")
+            transcriber.audio_buffer = bytearray(audio_data)
+            logger.info(f"Transcriber buffer size: {len(transcriber.audio_buffer)} bytes")
+            transcript = await transcriber.finalize()
+        finally:
+            _keepalive_task.cancel()
+            try:
+                await _keepalive_task
+            except asyncio.CancelledError:
+                pass
         
         if not transcript or transcript.strip() == "":
             # Failed transcription - don't forward to agent, just notify user and reset

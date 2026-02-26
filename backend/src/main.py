@@ -3,6 +3,9 @@ Voice API Server for GLaDOS Mobile Voice Interface
 FastAPI server providing STT (Whisper) and TTS (Piper) endpoints.
 """
 
+import asyncio
+import logging
+
 from fastapi import FastAPI, File, UploadFile, HTTPException
 from fastapi.responses import JSONResponse, FileResponse, HTMLResponse
 from fastapi.middleware.cors import CORSMiddleware
@@ -15,12 +18,45 @@ from pathlib import Path
 from typing import Optional
 
 from .utils import strip_markdown
+from .websocket import STT_BACKEND, VOXTRAL_MODEL
+
+_startup_logger = logging.getLogger(__name__)
 
 app = FastAPI(title="GLaDOS Voice API", version="0.2.0-streaming")
 
 # Register WebSocket routes for streaming
 from .websocket import register_websocket_routes
 register_websocket_routes(app)
+
+
+@app.on_event("startup")
+async def warmup_voxtral():
+    """
+    Pre-warm the Voxtral model in the background so the first real request
+    doesn't block waiting for model download/load.
+    Only runs when STT_BACKEND=voxtral.
+    """
+    if STT_BACKEND != "voxtral":
+        return
+
+    async def _warmup():
+        import httpx
+        from .websocket import VOXTRAL_SERVER_URL
+
+        _startup_logger.info(f"[Warmup] Waiting for Voxtral server at {VOXTRAL_SERVER_URL}...")
+        for attempt in range(40):  # up to ~2 min (40 × 3s)
+            await asyncio.sleep(3)
+            try:
+                async with httpx.AsyncClient(timeout=5.0) as client:
+                    r = await client.get(f"{VOXTRAL_SERVER_URL}/health")
+                    if r.status_code == 200 and r.json().get("status") == "ok":
+                        _startup_logger.info("[Warmup] Voxtral server ready ✓")
+                        return
+            except Exception:
+                pass
+        _startup_logger.warning("[Warmup] Voxtral server did not become ready — will use Whisper fallback")
+
+    asyncio.create_task(_warmup())
 
 # Enable CORS for PWA access
 app.add_middleware(

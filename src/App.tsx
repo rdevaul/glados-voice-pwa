@@ -535,23 +535,31 @@ function App() {
     }
   };
 
-  const requestMicPermission = async () => {
+  const requestMicPermission = async (): Promise<boolean> => {
     try {
       const stream = await navigator.mediaDevices.getUserMedia({ audio: true });
       stream.getTracks().forEach(t => t.stop());
       setMicPermission('granted');
+      return true;
     } catch {
       setMicPermission('denied');
+      return false;
     }
   };
 
-  const handleStartRecording = () => {
+  const handleStartRecording = async () => {
     // Warm up audio on user gesture
     audioQueue.current.warmUp();
-    
+
+    // On Safari standalone, permissions.query returns 'prompt' every session.
+    // Request permission here and, if granted, fall through to start recording
+    // immediately — don't make the user press twice.
+    let canRecord = micPermission === 'granted';
     if (micPermission === 'prompt') {
-      requestMicPermission();
-    } else if (micPermission === 'granted') {
+      canRecord = await requestMicPermission();
+    }
+
+    if (canRecord) {
       if (useStreaming) {
         handleStreamingStart();
       } else {

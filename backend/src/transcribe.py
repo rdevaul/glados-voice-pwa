@@ -1,15 +1,25 @@
 """
-Chunked audio transcription using Whisper.
-Buffers audio and transcribes in chunks for streaming partial results.
+Chunked audio transcription.
+
+Supports two backends:
+  - Whisper (default): runs local `whisper` CLI as a subprocess
+  - Voxtral (optional): calls mlx-audio server at http://localhost:8300
+    via the OpenAI-compatible /v1/audio/transcriptions endpoint
+
+Set STT_BACKEND=voxtral to enable Voxtral. Falls back to Whisper if the
+mlx-audio server is unreachable.
 """
 
 import asyncio
+import json
 import logging
 import subprocess
 import tempfile
 import uuid
 from pathlib import Path
 from typing import Optional, AsyncIterator, List
+
+import httpx
 
 logger = logging.getLogger(__name__)
 
@@ -255,3 +265,84 @@ class StreamingTranscriber:
                 self.audio_queue.get_nowait()
             except asyncio.QueueEmpty:
                 break
+
+
+class VoxtralTranscriber:
+    """
+    Transcriber that calls the mlx-audio Voxtral server.
+
+    Buffers all incoming audio and sends it as a single POST request to
+    the OpenAI-compatible /v1/audio/transcriptions endpoint when finalize()
+    is called.
+
+    Falls back to a ChunkedTranscriber (Whisper) if the server is unreachable.
+    """
+
+    def __init__(
+        self,
+        server_url: str = "http://localhost:8301",
+        model: str = "mlx-community/Voxtral-Mini-4B-Realtime-6bit",
+        fallback: bool = True,
+    ):
+        self.server_url = server_url
+        self.model = model
+        self.audio_buffer = bytearray()
+        self.audio_format: str = "webm"
+        self._fallback = ChunkedTranscriber() if fallback else None
+
+    def set_format(self, audio_format: str, sample_rate: int = 48000):
+        self.audio_format = audio_format
+        if self._fallback:
+            self._fallback.set_format(audio_format, sample_rate)
+
+    async def feed_audio(self, chunk: bytes) -> Optional[str]:
+        """Buffer audio — Voxtral transcribes on finalize, not mid-stream."""
+        self.audio_buffer.extend(chunk)
+        return None
+
+    async def finalize(self) -> str:
+        """POST buffered audio to the voxmlx server and return transcript."""
+        if not self.audio_buffer:
+            return ""
+
+        audio_data = bytes(self.audio_buffer)
+        self.reset()
+
+        tmp_id = uuid.uuid4().hex
+        tmp_dir = Path(tempfile.gettempdir())
+        input_file = tmp_dir / f"{tmp_id}.{self.audio_format}"
+
+        try:
+            input_file.write_bytes(audio_data)
+
+            # POST the raw audio — the server handles ffmpeg conversion internally
+            async with httpx.AsyncClient(timeout=600.0) as client:
+                with open(input_file, "rb") as f:
+                    resp = await client.post(
+                        f"{self.server_url}/v1/audio/transcriptions",
+                        data={"model": self.model, "language": "en"},
+                        files={"file": (f"{tmp_id}.{self.audio_format}", f,
+                                        f"audio/{self.audio_format}")},
+                    )
+
+            if resp.status_code != 200:
+                raise RuntimeError(f"Voxtral server {resp.status_code}: {resp.text[:200]}")
+
+            transcript = resp.json().get("text", "").strip()
+            logger.info(f"[Voxtral] Transcribed {len(audio_data)} bytes → {transcript[:80]!r}")
+            return transcript
+
+        except Exception as exc:
+            logger.warning(f"[Voxtral] Transcription failed ({exc}), falling back to Whisper")
+            if self._fallback:
+                self._fallback.audio_buffer = bytearray(audio_data)
+                return await self._fallback.finalize()
+            return ""
+
+        finally:
+            input_file.unlink(missing_ok=True)
+
+    def reset(self):
+        self.audio_buffer = bytearray()
+        if self._fallback:
+            self._fallback.reset()
