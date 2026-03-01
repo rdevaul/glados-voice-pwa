@@ -1,156 +1,137 @@
 /**
  * useThinkingTone — Ambient audio feedback during processing.
  *
- * Plays a soft, pulsing synthesized tone while the assistant is thinking,
- * so the user gets audio confirmation that processing is happening without
- * having to look at the screen (useful while driving, etc.).
+ * iOS Safari requires OscillatorNode.start() to happen within a user gesture,
+ * not just AudioContext.resume(). This hook pre-starts the oscillator silently
+ * during warmUp() (which is called from the button-press gesture), then
+ * start()/stop() simply ramp the gain up and down.
  *
  * Tone design:
- *   - Base: 180 Hz sine wave (low, unobtrusive)
- *   - Slow LFO pulse: 0.4 Hz AM modulation (gentle breathing rhythm)
- *   - Short fade-in / fade-out to avoid clicks
- *   - Volume: ~25% of full scale (background, not foreground)
- *
- * All synthesis via Web Audio API — no files, no network, no autoplay issues.
+ *   - 180 Hz sine wave, LFO-pulsed at 0.4 Hz (gentle breathing rhythm)
+ *   - Volume: ~22% of full scale — background, not foreground
+ *   - Smooth fade-in (0.4s) and fade-out (0.6s) to avoid clicks
  */
 
 import { useRef, useCallback, useEffect } from 'react';
 
 interface ThinkingToneOptions {
-  /** Base frequency in Hz. Default 180. */
-  frequency?: number;
-  /** Pulse rate in Hz (LFO). Default 0.4 (one pulse per ~2.5 seconds). */
-  pulseRate?: number;
-  /** Volume 0–1. Default 0.22. */
-  volume?: number;
-  /** Fade-in duration in seconds. Default 0.4. */
-  fadeIn?: number;
-  /** Fade-out duration in seconds. Default 0.6. */
-  fadeOut?: number;
+  frequency?: number;   // Hz, default 180
+  pulseRate?: number;   // LFO Hz, default 0.4
+  volume?: number;      // 0-1, default 0.22
+  fadeIn?: number;      // seconds, default 0.4
+  fadeOut?: number;     // seconds, default 0.6
 }
 
 export function useThinkingTone(options: ThinkingToneOptions = {}) {
   const {
     frequency = 180,
     pulseRate = 0.4,
-    volume = 0.22,
-    fadeIn = 0.4,
-    fadeOut = 0.6,
+    volume    = 0.22,
+    fadeIn    = 0.4,
+    fadeOut   = 0.6,
   } = options;
 
-  const ctxRef      = useRef<AudioContext | null>(null);
-  const oscRef      = useRef<OscillatorNode | null>(null);
-  const lfoRef      = useRef<OscillatorNode | null>(null);
-  const gainRef     = useRef<GainNode | null>(null);
-  const lfoGainRef  = useRef<GainNode | null>(null);
-  const activeRef   = useRef(false);
+  const ctxRef     = useRef<AudioContext | null>(null);
+  const gainRef    = useRef<GainNode | null>(null);
+  const readyRef   = useRef(false);   // true once graph is built + osc started
+  const activeRef  = useRef(false);   // true while tone should be audible
 
-  const getCtx = useCallback((): AudioContext => {
-    if (!ctxRef.current || ctxRef.current.state === 'closed') {
-      ctxRef.current = new AudioContext();
-    }
-    return ctxRef.current;
-  }, []);
-
+  /**
+   * warmUp — call inside a user gesture (button press).
+   * Builds the entire Web Audio graph and starts oscillators at gain=0.
+   * Safe to call multiple times; no-ops after the first successful call.
+   */
   const warmUp = useCallback(() => {
-    // Call during a user gesture to pre-create and unlock the AudioContext.
-    // This prevents autoplay policy blocking when processing starts
-    // (which may be slightly after the gesture completes).
-    const ctx = getCtx();
-    if (ctx.state === 'suspended') {
-      ctx.resume().catch(() => {});
-    }
-  }, [getCtx]);
+    if (readyRef.current) return;
 
+    try {
+      const ctx = new AudioContext();
+      ctxRef.current = ctx;
+
+      // Resume immediately — we're inside a gesture
+      if (ctx.state === 'suspended') {
+        ctx.resume().catch(() => {});
+      }
+
+      const now = ctx.currentTime;
+
+      // Main oscillator
+      const osc = ctx.createOscillator();
+      osc.type = 'sine';
+      osc.frequency.setValueAtTime(frequency, now);
+
+      // LFO for amplitude modulation
+      const lfo = ctx.createOscillator();
+      lfo.type = 'sine';
+      lfo.frequency.setValueAtTime(pulseRate, now);
+
+      // LFO gain (scales modulation depth)
+      const lfoGain = ctx.createGain();
+      lfoGain.gain.setValueAtTime(volume * 0.4, now);
+
+      // Master gain — starts at 0 (silent), ramped by start()/stop()
+      const masterGain = ctx.createGain();
+      masterGain.gain.setValueAtTime(0, now);
+
+      // Graph: osc → masterGain → destination
+      //        lfo → lfoGain → masterGain.gain (AM)
+      osc.connect(masterGain);
+      lfo.connect(lfoGain);
+      lfoGain.connect(masterGain.gain);
+      masterGain.connect(ctx.destination);
+
+      // Start oscillators NOW, inside the gesture — gain is 0 so silent
+      osc.start(now);
+      lfo.start(now);
+
+      gainRef.current = masterGain;
+      readyRef.current = true;
+    } catch (e) {
+      console.warn('useThinkingTone: Web Audio API unavailable', e);
+    }
+  }, [frequency, pulseRate, volume]);
+
+  /** Fade the tone in. Call when processing starts. */
   const start = useCallback(() => {
-    if (activeRef.current) return;
+    if (!readyRef.current || activeRef.current) return;
     activeRef.current = true;
 
-    const ctx = getCtx();
+    const ctx  = ctxRef.current!;
+    const gain = gainRef.current!;
+    const now  = ctx.currentTime;
 
-    // Resume if suspended (browser autoplay policy)
+    // Resume context if it got suspended (e.g. tab backgrounded)
     if (ctx.state === 'suspended') {
       ctx.resume().catch(() => {});
     }
 
-    const now = ctx.currentTime;
-
-    // Main oscillator — sine wave at base frequency
-    const osc = ctx.createOscillator();
-    osc.type = 'sine';
-    osc.frequency.setValueAtTime(frequency, now);
-
-    // Master gain — controls overall volume with fade-in
-    const gain = ctx.createGain();
-    gain.gain.setValueAtTime(0, now);
+    gain.gain.cancelScheduledValues(now);
+    gain.gain.setValueAtTime(gain.gain.value, now);
     gain.gain.linearRampToValueAtTime(volume, now + fadeIn);
+  }, [volume, fadeIn]);
 
-    // LFO — slow pulse amplitude modulation
-    const lfo = ctx.createOscillator();
-    lfo.type = 'sine';
-    lfo.frequency.setValueAtTime(pulseRate, now);
-
-    // LFO gain — scales LFO output to ±40% of master volume
-    const lfoGain = ctx.createGain();
-    lfoGain.gain.setValueAtTime(volume * 0.4, now);
-
-    // Graph: osc → gain → destination
-    //        lfo → lfoGain → gain.gain (modulates master gain)
-    osc.connect(gain);
-    lfo.connect(lfoGain);
-    lfoGain.connect(gain.gain);  // AM modulation
-    gain.connect(ctx.destination);
-
-    osc.start(now);
-    lfo.start(now);
-
-    oscRef.current     = osc;
-    lfoRef.current     = lfo;
-    gainRef.current    = gain;
-    lfoGainRef.current = lfoGain;
-  }, [frequency, pulseRate, volume, fadeIn, getCtx]);
-
+  /** Fade the tone out. Call when processing ends. */
   const stop = useCallback(() => {
-    if (!activeRef.current) return;
+    if (!readyRef.current || !activeRef.current) return;
     activeRef.current = false;
 
-    const ctx = ctxRef.current;
-    const gain = gainRef.current;
-    const osc = oscRef.current;
-    const lfo = lfoRef.current;
+    const ctx  = ctxRef.current!;
+    const gain = gainRef.current!;
+    const now  = ctx.currentTime;
 
-    if (!ctx || !gain || !osc || !lfo) return;
-
-    const now = ctx.currentTime;
-
-    // Fade out, then stop nodes
     gain.gain.cancelScheduledValues(now);
     gain.gain.setValueAtTime(gain.gain.value, now);
     gain.gain.linearRampToValueAtTime(0, now + fadeOut);
-
-    const stopTime = now + fadeOut + 0.05;
-    osc.stop(stopTime);
-    lfo.stop(stopTime);
-
-    // Clean up refs after stop
-    setTimeout(() => {
-      oscRef.current     = null;
-      lfoRef.current     = null;
-      gainRef.current    = null;
-      lfoGainRef.current = null;
-    }, (fadeOut + 0.1) * 1000);
   }, [fadeOut]);
 
-  // Clean up AudioContext on unmount
+  // Close AudioContext on unmount
   useEffect(() => {
     return () => {
-      if (activeRef.current) {
-        oscRef.current?.stop();
-        lfoRef.current?.stop();
-      }
       ctxRef.current?.close().catch(() => {});
+      readyRef.current = false;
+      activeRef.current = false;
     };
   }, []);
 
-  return { start, stop, warmUp };
+  return { warmUp, start, stop };
 }
