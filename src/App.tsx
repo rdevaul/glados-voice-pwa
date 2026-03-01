@@ -4,6 +4,7 @@ import type { Components } from 'react-markdown';
 import remarkGfm from 'remark-gfm';
 import { useVoiceRecorder } from './hooks/useVoiceRecorder';
 import { useVoiceStream } from './hooks/useVoiceStream';
+import { useThinkingTone } from './hooks/useThinkingTone';
 import { PushToTalkButton } from './components/PushToTalkButton';
 import { chatWithText, chatWithAudio, getAudioUrl } from './api/voiceApi';
 import { getAudioQueue } from './utils/audioQueue';
@@ -157,6 +158,16 @@ function App() {
   
   // Streaming mode hooks
   const stream = useVoiceStream(WS_URL);
+  const thinkingTone = useThinkingTone({ frequency: 180, pulseRate: 0.4, volume: 0.22 });
+
+  // Thinking tone: start when processing, stop otherwise
+  useEffect(() => {
+    if (stream.status === 'processing') {
+      thinkingTone.start();
+    } else {
+      thinkingTone.stop();
+    }
+  }, [stream.status, thinkingTone.start, thinkingTone.stop]);
   const audioQueue = useRef(getAudioQueue());
 
   // Determine which mode we're using
