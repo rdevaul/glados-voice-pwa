@@ -45,6 +45,7 @@ export function useThinkingTone(options: ThinkingToneOptions = {}) {
     if (readyRef.current) return;
 
     try {
+      console.log('[ThinkingTone] warmUp called, building audio graph');
       const ctx = new AudioContext();
       ctxRef.current = ctx;
 
@@ -86,6 +87,7 @@ export function useThinkingTone(options: ThinkingToneOptions = {}) {
 
       gainRef.current = masterGain;
       readyRef.current = true;
+      console.log('[ThinkingTone] audio graph ready, ctx.state:', ctx.state);
     } catch (e) {
       console.warn('useThinkingTone: Web Audio API unavailable', e);
     }
@@ -93,6 +95,7 @@ export function useThinkingTone(options: ThinkingToneOptions = {}) {
 
   /** Fade the tone in. Call when processing starts. */
   const start = useCallback(() => {
+    console.log('[ThinkingTone] start() called, ready:', readyRef.current, 'active:', activeRef.current);
     if (!readyRef.current || activeRef.current) return;
     activeRef.current = true;
 

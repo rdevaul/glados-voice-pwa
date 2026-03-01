@@ -162,7 +162,9 @@ function App() {
 
   // Thinking tone: start when processing, stop otherwise
   useEffect(() => {
+    console.log('[ThinkingTone] status:', stream.status);
     if (stream.status === 'processing') {
+      console.log('[ThinkingTone] starting tone');
       thinkingTone.start();
     } else {
       thinkingTone.stop();
@@ -559,8 +561,9 @@ function App() {
   };
 
   const handleStartRecording = async () => {
-    // Warm up audio on user gesture
+    // Warm up audio on user gesture — must happen synchronously before any awaits
     audioQueue.current.warmUp();
+    thinkingTone.warmUp();  // pre-start oscillators while inside gesture (iOS requirement)
 
     // On Safari standalone, permissions.query returns 'prompt' every session.
     // Request permission here and, if granted, fall through to start recording
