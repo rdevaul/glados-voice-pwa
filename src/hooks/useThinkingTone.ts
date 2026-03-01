@@ -52,6 +52,16 @@ export function useThinkingTone(options: ThinkingToneOptions = {}) {
     return ctxRef.current;
   }, []);
 
+  const warmUp = useCallback(() => {
+    // Call during a user gesture to pre-create and unlock the AudioContext.
+    // This prevents autoplay policy blocking when processing starts
+    // (which may be slightly after the gesture completes).
+    const ctx = getCtx();
+    if (ctx.state === 'suspended') {
+      ctx.resume().catch(() => {});
+    }
+  }, [getCtx]);
+
   const start = useCallback(() => {
     if (activeRef.current) return;
     activeRef.current = true;
@@ -142,5 +152,5 @@ export function useThinkingTone(options: ThinkingToneOptions = {}) {
     };
   }, []);
 
-  return { start, stop };
+  return { start, stop, warmUp };
 }
