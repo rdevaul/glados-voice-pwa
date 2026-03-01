@@ -1,25 +1,21 @@
 /**
  * useThinkingTone — Ambient audio feedback during processing.
  *
- * iOS Safari requires OscillatorNode.start() to happen within a user gesture,
- * not just AudioContext.resume(). This hook pre-starts the oscillator silently
- * during warmUp() (which is called from the button-press gesture), then
- * start()/stop() simply ramp the gain up and down.
- *
- * Tone design:
- *   - 180 Hz sine wave, LFO-pulsed at 0.4 Hz (gentle breathing rhythm)
- *   - Volume: ~22% of full scale — background, not foreground
- *   - Smooth fade-in (0.4s) and fade-out (0.6s) to avoid clicks
+ * Shares the AudioContext unlocked by AudioQueue.warmUp(), so both
+ * response audio and the thinking tone use the same unlocked context.
+ * This avoids Chrome's autoplay restriction (which only blocks new
+ * AudioContexts, not nodes added to an already-running context).
  */
 
 import { useRef, useCallback, useEffect } from 'react';
+import { getAudioQueue } from '../utils/audioQueue';
 
 interface ThinkingToneOptions {
-  frequency?: number;   // Hz, default 180
-  pulseRate?: number;   // LFO Hz, default 0.4
-  volume?: number;      // 0-1, default 0.22
-  fadeIn?: number;      // seconds, default 0.4
-  fadeOut?: number;     // seconds, default 0.6
+  frequency?: number;
+  pulseRate?: number;
+  volume?: number;
+  fadeIn?: number;
+  fadeOut?: number;
 }
 
 export function useThinkingTone(options: ThinkingToneOptions = {}) {
@@ -31,108 +27,101 @@ export function useThinkingTone(options: ThinkingToneOptions = {}) {
     fadeOut   = 0.6,
   } = options;
 
-  const ctxRef     = useRef<AudioContext | null>(null);
-  const gainRef    = useRef<GainNode | null>(null);
-  const readyRef   = useRef(false);   // true once graph is built + osc started
-  const activeRef  = useRef(false);   // true while tone should be audible
+  const gainRef   = useRef<GainNode | null>(null);
+  const readyRef  = useRef(false);
+  const activeRef = useRef(false);
 
   /**
-   * warmUp — call inside a user gesture (button press).
-   * Builds the entire Web Audio graph and starts oscillators at gain=0.
-   * Safe to call multiple times; no-ops after the first successful call.
+   * warmUp — call on button press. Builds the tone graph using the
+   * AudioContext that AudioQueue just unlocked in the same gesture.
    */
   const warmUp = useCallback(() => {
     if (readyRef.current) return;
 
-    try {
-      console.log('[ThinkingTone] warmUp called, building audio graph');
-      const ctx = new AudioContext();
-      ctxRef.current = ctx;
-
-      // Resume immediately — we're inside a gesture
-      if (ctx.state === 'suspended') {
-        ctx.resume().catch(() => {});
+    // Give AudioQueue's warmUp a moment to unlock the context
+    // (both are called synchronously in handleStartRecording, but
+    // AudioQueue's unlock is async internally via resumePromise)
+    const tryBuild = (attempt: number) => {
+      const ctx = getAudioQueue().getContext();
+      if (!ctx) {
+        if (attempt < 10) {
+          setTimeout(() => tryBuild(attempt + 1), 100);
+        } else {
+          console.warn('[ThinkingTone] AudioContext never became available');
+        }
+        return;
       }
+
+      if (readyRef.current) return; // already built by a parallel attempt
+      console.log('[ThinkingTone] building tone graph on shared AudioContext');
 
       const now = ctx.currentTime;
 
-      // Main oscillator
       const osc = ctx.createOscillator();
       osc.type = 'sine';
       osc.frequency.setValueAtTime(frequency, now);
 
-      // LFO for amplitude modulation
       const lfo = ctx.createOscillator();
       lfo.type = 'sine';
       lfo.frequency.setValueAtTime(pulseRate, now);
 
-      // LFO gain (scales modulation depth)
       const lfoGain = ctx.createGain();
       lfoGain.gain.setValueAtTime(volume * 0.4, now);
 
-      // Master gain — starts at 0 (silent), ramped by start()/stop()
       const masterGain = ctx.createGain();
-      masterGain.gain.setValueAtTime(0, now);
+      masterGain.gain.setValueAtTime(0, now); // silent until start()
 
-      // Graph: osc → masterGain → destination
-      //        lfo → lfoGain → masterGain.gain (AM)
       osc.connect(masterGain);
       lfo.connect(lfoGain);
       lfoGain.connect(masterGain.gain);
       masterGain.connect(ctx.destination);
 
-      // Start oscillators NOW, inside the gesture — gain is 0 so silent
       osc.start(now);
       lfo.start(now);
 
       gainRef.current = masterGain;
       readyRef.current = true;
-      console.log('[ThinkingTone] audio graph ready, ctx.state:', ctx.state);
-    } catch (e) {
-      console.warn('useThinkingTone: Web Audio API unavailable', e);
-    }
+      console.log('[ThinkingTone] ready');
+    };
+
+    tryBuild(0);
   }, [frequency, pulseRate, volume]);
 
-  /** Fade the tone in. Call when processing starts. */
   const start = useCallback(() => {
-    console.log('[ThinkingTone] start() called, ready:', readyRef.current, 'active:', activeRef.current);
+    console.log('[ThinkingTone] start() — ready:', readyRef.current, 'active:', activeRef.current);
     if (!readyRef.current || activeRef.current) return;
     activeRef.current = true;
 
-    const ctx  = ctxRef.current!;
-    const gain = gainRef.current!;
-    const now  = ctx.currentTime;
+    const ctx = getAudioQueue().getContext();
+    const gain = gainRef.current;
+    if (!ctx || !gain) return;
 
-    // Resume context if it got suspended (e.g. tab backgrounded)
-    if (ctx.state === 'suspended') {
-      ctx.resume().catch(() => {});
-    }
-
+    const now = ctx.currentTime;
     gain.gain.cancelScheduledValues(now);
     gain.gain.setValueAtTime(gain.gain.value, now);
     gain.gain.linearRampToValueAtTime(volume, now + fadeIn);
   }, [volume, fadeIn]);
 
-  /** Fade the tone out. Call when processing ends. */
   const stop = useCallback(() => {
     if (!readyRef.current || !activeRef.current) return;
     activeRef.current = false;
 
-    const ctx  = ctxRef.current!;
-    const gain = gainRef.current!;
-    const now  = ctx.currentTime;
+    const ctx = getAudioQueue().getContext();
+    const gain = gainRef.current;
+    if (!ctx || !gain) return;
 
+    const now = ctx.currentTime;
     gain.gain.cancelScheduledValues(now);
     gain.gain.setValueAtTime(gain.gain.value, now);
     gain.gain.linearRampToValueAtTime(0, now + fadeOut);
   }, [fadeOut]);
 
-  // Close AudioContext on unmount
   useEffect(() => {
     return () => {
-      ctxRef.current?.close().catch(() => {});
+      // Don't close the shared AudioContext — AudioQueue owns it
       readyRef.current = false;
       activeRef.current = false;
+      gainRef.current = null;
     };
   }, []);
 
