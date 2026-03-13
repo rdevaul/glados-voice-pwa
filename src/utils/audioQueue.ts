@@ -31,6 +31,11 @@ export class AudioQueue {
   private mediaSource: MediaElementAudioSourceNode | null = null;
   private unlocked: boolean = false;
 
+  // Keepalive tone — prevents AudioContext suspension
+  private keepaliveOsc: OscillatorNode | null = null;
+  private keepaliveGain: GainNode | null = null;
+  private keepaliveRunning: boolean = false;
+
   public onPlaybackStart?: AudioQueueCallback;
   public onPlaybackEnd?: AudioQueueCallback;
   public onQueueEmpty?: AudioQueueEmptyCallback;
@@ -46,6 +51,9 @@ export class AudioQueue {
       }
       this.currentUrl = null;
       this._isPlaying = false;
+
+      // Resume keepalive before playing next (if queue empty, onQueueEmpty will handle it)
+      this.resumeKeepalive();
       this.playNext();
     };
 
@@ -62,13 +70,103 @@ export class AudioQueue {
   }
 
   /**
+   * Start the keepalive tone — a continuous very quiet sine wave that prevents
+   * AudioContext suspension. Called automatically after warmUp() unlocks the context.
+   */
+  private startKeepalive(): void {
+    const ctx = this.ctx;
+    if (!ctx || this.keepaliveRunning) return;
+
+    console.log('[AudioQueue] startKeepalive — ctx.state:', ctx.state);
+
+    const now = ctx.currentTime;
+
+    // Create a continuous quiet sine wave at 220Hz (A3)
+    this.keepaliveOsc = ctx.createOscillator();
+    this.keepaliveOsc.type = 'sine';
+    this.keepaliveOsc.frequency.setValueAtTime(220, now);
+
+    this.keepaliveGain = ctx.createGain();
+    this.keepaliveGain.gain.setValueAtTime(0.02, now); // Very quiet — barely audible
+
+    this.keepaliveOsc.connect(this.keepaliveGain);
+    this.keepaliveGain.connect(ctx.destination);
+
+    this.keepaliveOsc.start(now);
+    this.keepaliveRunning = true;
+    console.log('[AudioQueue] keepalive tone started');
+  }
+
+  /**
+   * Stop the keepalive tone temporarily (e.g., during TTS playback).
+   */
+  public stopKeepalive(): void {
+    if (!this.keepaliveGain || !this.keepaliveRunning) return;
+
+    const ctx = this.ctx;
+    if (!ctx) return;
+
+    console.log('[AudioQueue] stopKeepalive — pausing during TTS');
+    const now = ctx.currentTime;
+
+    // Ramp down to silence quickly
+    this.keepaliveGain.gain.cancelScheduledValues(now);
+    this.keepaliveGain.gain.setValueAtTime(this.keepaliveGain.gain.value, now);
+    this.keepaliveGain.gain.linearRampToValueAtTime(0, now + 0.05);
+  }
+
+  /**
+   * Resume the keepalive tone after TTS playback.
+   */
+  private resumeKeepalive(): void {
+    if (!this.keepaliveGain || !this.keepaliveRunning) return;
+
+    const ctx = this.ctx;
+    if (!ctx) return;
+
+    console.log('[AudioQueue] resumeKeepalive — restoring after TTS');
+    const now = ctx.currentTime;
+
+    // Ramp back up to keepalive volume
+    this.keepaliveGain.gain.cancelScheduledValues(now);
+    this.keepaliveGain.gain.setValueAtTime(this.keepaliveGain.gain.value, now);
+    this.keepaliveGain.gain.linearRampToValueAtTime(0.02, now + 0.1);
+  }
+
+  /**
+   * Synthesize a short beep using the AudioContext.
+   * Safe to call any time after the context is created (even before unlocked=true,
+   * since it's called from inside the gesture-driven resumePromise.then()).
+   */
+  public playBeep(frequency = 880, duration = 0.25, volume = 0.55): void {
+    const ctx = this.ctx;
+    if (!ctx) return;
+    console.log('[AudioQueue] playBeep — ctx.state:', ctx.state, 'currentTime:', ctx.currentTime);
+    const now = ctx.currentTime;
+    const osc = ctx.createOscillator();
+    const gain = ctx.createGain();
+    osc.type = 'sine';
+    osc.frequency.setValueAtTime(frequency, now);
+    gain.gain.setValueAtTime(0, now);
+    gain.gain.linearRampToValueAtTime(volume, now + 0.008);   // fast attack
+    gain.gain.linearRampToValueAtTime(0, now + duration);     // smooth release
+    osc.connect(gain);
+    gain.connect(ctx.destination);
+    osc.start(now);
+    osc.stop(now + duration + 0.01);
+  }
+
+  /**
    * Call from a user gesture to unlock audio for the session.
-   * Creates an AudioContext, plays a silent buffer to unlock it, and
+   * Creates an AudioContext, plays a start beep to unlock it, and
    * connects the HTMLAudioElement to the context graph.
    * Once unlocked, audio can play at any future time.
+   * Also plays the start beep on every subsequent call (each button press).
    */
   public warmUp(): void {
     if (this.unlocked) {
+      // Already unlocked — play the start beep immediately for this press
+      this.playBeep();
       if (this.queue.length > 0 && !this._isPlaying && !this._isPaused) {
         this.playNext();
       }
@@ -76,43 +174,63 @@ export class AudioQueue {
     }
 
     try {
-      // Create AudioContext within the gesture
+      // Create AudioContext within the gesture.
+      // On Chrome/Safari, a context created inside a user gesture starts 'running'
+      // immediately — no need to await resume(). Waiting on resume() can stall
+      // indefinitely on iOS WebKit inside React synthetic events.
       if (!this.ctx || this.ctx.state === 'closed') {
         this.ctx = new AudioContext();
       }
       const ctx = this.ctx;
 
-      // Resume if suspended
-      const resumePromise = ctx.state === 'suspended' ? ctx.resume() : Promise.resolve();
+      console.log('[AudioQueue] warmUp — ctx.state:', ctx.state);
 
-      resumePromise.then(() => {
-        // Play a silent 1-frame buffer — this is the key unlock step for Chrome
-        const buf = ctx.createBuffer(1, 1, ctx.sampleRate);
-        const src = ctx.createBufferSource();
-        src.buffer = buf;
-        src.connect(ctx.destination);
-        src.start(0);
+      // Connect the HTMLAudioElement to the AudioContext graph synchronously.
+      // createMediaElementSource can only be called once per element.
+      if (!this.mediaSource) {
+        this.mediaSource = ctx.createMediaElementSource(this.audio);
+        this.mediaSource.connect(ctx.destination);
+      }
 
-        // Connect the HTMLAudioElement to the AudioContext graph.
-        // createMediaElementSource can only be called once per element.
-        if (!this.mediaSource) {
-          this.mediaSource = ctx.createMediaElementSource(this.audio);
-          this.mediaSource.connect(ctx.destination);
-        }
+      // Mark unlocked immediately — don't block on resume() promise.
+      this.unlocked = true;
+      console.log('[AudioQueue] unlocked (synchronous)');
 
-        this.unlocked = true;
-        console.log('[AudioQueue] unlocked via AudioContext');
+      // Play the beep once the context is actually running.
+      // On iOS the context starts suspended even inside a gesture; we can't schedule
+      // oscillators against currentTime=0 and expect them to fire correctly after resume.
+      // Strategy: play immediately if already running, otherwise wait for resume()
+      // with a 250ms timeout fallback (the nudge above should resolve it in <50ms).
+      if (ctx.state === 'running') {
+        this.playBeep();
+        this.startKeepalive();
+      } else {
+        console.log('[AudioQueue] ctx suspended — waiting for resume before beep');
+        let beeped = false;
+        const beepWhenReady = () => {
+          if (beeped) return;
+          beeped = true;
+          this.playBeep();
+          this.startKeepalive();
+        };
+        // Timeout fallback: play anyway after 250ms even if resume() is slow
+        const fallbackTimer = setTimeout(beepWhenReady, 250);
+        ctx.resume().then(() => {
+          clearTimeout(fallbackTimer);
+          beepWhenReady();
+        }).catch(err => {
+          clearTimeout(fallbackTimer);
+          console.log('[AudioQueue] resume failed:', String(err));
+        });
+      }
 
-        // Play anything that was queued while waiting for unlock
-        if (this.queue.length > 0 && !this._isPlaying) {
-          this.playNext();
-        }
-      }).catch(err => {
-        console.warn('[AudioQueue] warmUp failed:', err);
-      });
+      // Play anything that was queued
+      if (this.queue.length > 0 && !this._isPlaying) {
+        this.playNext();
+      }
 
     } catch (err) {
-      console.warn('[AudioQueue] AudioContext creation failed, falling back:', err);
+      console.log('[AudioQueue] AudioContext creation failed, using fallback:', String(err));
       // Fallback: original silent-audio approach
       const silentAudio = new Audio();
       silentAudio.src = 'data:audio/wav;base64,UklGRiQAAABXQVZFZm10IBAAAAABAAEARKwAAIhYAQACABAAZGF0YQAAAAA=';
@@ -182,6 +300,8 @@ export class AudioQueue {
   private playNext(): void {
     if (this.queue.length === 0) {
       this._isPlaying = false;
+      // Restore keepalive when queue empties
+      this.resumeKeepalive();
       this.onQueueEmpty?.();
       return;
     }
@@ -189,6 +309,9 @@ export class AudioQueue {
     const url = this.queue.shift()!;
     this.currentUrl = url;
     this.audio.src = url;
+
+    // Pause keepalive during TTS playback
+    this.stopKeepalive();
 
     this.onPlaybackStart?.(url);
 
@@ -209,8 +332,12 @@ export class AudioQueue {
             // Autoplay blocked — re-queue, will retry on next warmUp
             this.queue.unshift(url);
             this.unlocked = false;
+            // Restore keepalive if playback failed
+            this.resumeKeepalive();
           } else if (this.onError) {
             this.onError(err, url);
+            // Restore keepalive on error
+            this.resumeKeepalive();
           }
         });
     }

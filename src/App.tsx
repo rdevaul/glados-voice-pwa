@@ -1,4 +1,4 @@
-import { useState, useEffect, useRef, useCallback } from 'react';
+import { useState, useEffect, useRef, useCallback, useLayoutEffect } from 'react';
 import ReactMarkdown from 'react-markdown';
 import type { Components } from 'react-markdown';
 import remarkGfm from 'remark-gfm';
@@ -138,6 +138,25 @@ function App() {
   const [messages, setMessages] = useState<Message[]>(loadMessages);
   const [textInput, setTextInput] = useState('');
   const [isProcessing, setIsProcessing] = useState(false);
+
+  // Debug log overlay — tap status icon 5× to toggle
+  const [debugLogs, setDebugLogs] = useState<string[]>([]);
+  const [showDebug, setShowDebug] = useState(false);
+  const statusTapCountRef = useRef(0);
+  const statusTapTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null);
+
+  // Intercept console.log for debug overlay
+  useLayoutEffect(() => {
+    const orig = console.log.bind(console);
+    console.log = (...args: unknown[]) => {
+      orig(...args);
+      const line = args.map(a => (typeof a === 'object' ? JSON.stringify(a) : String(a))).join(' ');
+      if (line.includes('[AudioQueue]') || line.includes('[ThinkingTone]')) {
+        setDebugLogs(prev => [...prev.slice(-49), `${new Date().toISOString().slice(11,23)} ${line}`]);
+      }
+    };
+    return () => { console.log = orig; };
+  }, []);
   const [micPermission, setMicPermission] = useState<'prompt' | 'granted' | 'denied'>('prompt');
   const [useStreaming, setUseStreaming] = useState(STREAMING_ENABLED);
   
@@ -158,18 +177,33 @@ function App() {
   
   // Streaming mode hooks
   const stream = useVoiceStream(WS_URL);
-  const thinkingTone = useThinkingTone({ frequency: 180, pulseRate: 0.4, volume: 0.22 });
+  const thinkingTone = useThinkingTone({ frequency: 440, pulseRate: 0.5, volume: 0.45 });
 
-  // Thinking tone: start when processing, stop otherwise
+  // Thinking tone: start on button release (handleStopRecording), stop here.
+  // Stop when: recording starts again, disconnected, or response completes.
   useEffect(() => {
-    console.log('[ThinkingTone] status:', stream.status);
-    if (stream.status === 'processing') {
-      console.log('[ThinkingTone] starting tone');
-      thinkingTone.start();
-    } else {
+    if (stream.status === 'recording' || stream.status === 'disconnected') {
       thinkingTone.stop();
     }
-  }, [stream.status, thinkingTone.start, thinkingTone.stop]);
+  }, [stream.status, thinkingTone.stop]);
+
+  // Also stop thinking tone when response completes (handles text-only / no-audio responses).
+  useEffect(() => {
+    if (stream.responseComplete) {
+      thinkingTone.stop();
+    }
+  }, [stream.responseComplete, thinkingTone.stop]);
+
+  // Stop thinking tone as soon as TTS audio starts playing — seamless handoff.
+  useEffect(() => {
+    const q = audioQueue.current;
+    const prev = q.onPlaybackStart;
+    q.onPlaybackStart = (url: string) => {
+      thinkingTone.stop();
+      prev?.(url);
+    };
+    return () => { q.onPlaybackStart = prev; };
+  }, [thinkingTone.stop]);
   const audioQueue = useRef(getAudioQueue());
 
   // Determine which mode we're using
@@ -423,7 +457,10 @@ function App() {
 
   const playAudio = useCallback((url: string) => {
     if (!url) return;
-    
+
+    // Stop thinking tone — play button bypasses audioQueue.onPlaybackStart
+    thinkingTone.stop();
+
     // Warm up audio queue on first interaction
     audioQueue.current.warmUp();
     
@@ -561,9 +598,12 @@ function App() {
   };
 
   const handleStartRecording = async () => {
+    // Stop any lingering thinking tone from a previous interaction
+    thinkingTone.stop();
+
     // Warm up audio on user gesture — must happen synchronously before any awaits
+    // This unlocks the AudioContext and starts the keepalive tone
     audioQueue.current.warmUp();
-    thinkingTone.warmUp();  // pre-start oscillators while inside gesture (iOS requirement)
 
     // On Safari standalone, permissions.query returns 'prompt' every session.
     // Request permission here and, if granted, fall through to start recording
@@ -588,6 +628,10 @@ function App() {
     } else {
       batchStopRecording();
     }
+    // Start thinking tone immediately on button release — don't wait for server status.
+    // The oscillators are already running at gain=0 (warmed up on press), so this
+    // is just a gain ramp: zero latency, no gap between release and tone.
+    thinkingTone.start();
   };
 
   const handleTextSubmit = useStreaming ? handleStreamingTextSubmit : handleBatchTextSubmit;
@@ -625,9 +669,21 @@ function App() {
       <header className="header">
         <h1>🎂 GLaDOS</h1>
         <div className="header-controls">
-          <button 
-            className="status-button" 
-            onClick={toggleStreamingMode}
+          <button
+            className="status-button"
+            onClick={() => {
+              statusTapCountRef.current += 1;
+              if (statusTapTimerRef.current) clearTimeout(statusTapTimerRef.current);
+              if (statusTapCountRef.current >= 5) {
+                statusTapCountRef.current = 0;
+                setShowDebug(v => !v);
+              } else {
+                statusTapTimerRef.current = setTimeout(() => {
+                  statusTapCountRef.current = 0;
+                  toggleStreamingMode();
+                }, 400);
+              }
+            }}
             title={useStreaming ? `Streaming: ${stream.status}` : 'Batch mode'}
           >
             {getStatusIcon()}
@@ -724,6 +780,24 @@ function App() {
         ))}
         <div ref={messagesEndRef} />
       </main>
+
+      {showDebug && (
+        <div style={{
+          position: 'fixed', bottom: '140px', left: '8px', right: '8px',
+          background: 'rgba(0,0,0,0.88)', color: '#0f0', fontFamily: 'monospace',
+          fontSize: '11px', padding: '8px', borderRadius: '8px', zIndex: 9999,
+          maxHeight: '220px', overflowY: 'auto',
+        }}>
+          <div style={{ display: 'flex', justifyContent: 'space-between', marginBottom: '4px' }}>
+            <strong>Debug Log</strong>
+            <button onClick={() => setDebugLogs([])} style={{ background: 'none', border: 'none', color: '#f88', cursor: 'pointer' }}>clear</button>
+          </div>
+          {debugLogs.length === 0
+            ? <div style={{ color: '#888' }}>No [AudioQueue]/[ThinkingTone] logs yet. Press the button.</div>
+            : debugLogs.map((l, i) => <div key={i}>{l}</div>)
+          }
+        </div>
+      )}
 
       {error && <div className="error">{error}</div>}
 
