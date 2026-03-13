@@ -205,22 +205,20 @@ export class AudioQueue {
         this.playBeep();
         this.startKeepalive();
       } else {
-        console.log('[AudioQueue] ctx suspended — waiting for resume before beep');
-        let beeped = false;
-        const beepWhenReady = () => {
-          if (beeped) return;
-          beeped = true;
+        console.log('[AudioQueue] ctx suspended — resuming before beep');
+        // Must resume() first, THEN schedule audio nodes against the
+        // now-advancing currentTime. Scheduling against currentTime=0
+        // of a suspended context means the beep is "already over" by
+        // the time the context starts running.
+        ctx.resume().then(() => {
+          console.log('[AudioQueue] resumed — ctx.currentTime:', ctx.currentTime);
           this.playBeep();
           this.startKeepalive();
-        };
-        // Timeout fallback: play anyway after 250ms even if resume() is slow
-        const fallbackTimer = setTimeout(beepWhenReady, 250);
-        ctx.resume().then(() => {
-          clearTimeout(fallbackTimer);
-          beepWhenReady();
         }).catch(err => {
-          clearTimeout(fallbackTimer);
-          console.log('[AudioQueue] resume failed:', String(err));
+          console.log('[AudioQueue] resume failed, trying beep anyway:', String(err));
+          // Fallback: try anyway — some browsers resolve resume weirdly
+          this.playBeep();
+          this.startKeepalive();
         });
       }
 
