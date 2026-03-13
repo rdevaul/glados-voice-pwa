@@ -87,7 +87,7 @@ export class AudioQueue {
     this.keepaliveOsc.frequency.setValueAtTime(220, now);
 
     this.keepaliveGain = ctx.createGain();
-    this.keepaliveGain.gain.setValueAtTime(0.02, now); // Very quiet — barely audible
+    this.keepaliveGain.gain.setValueAtTime(0.005, now); // Near-silent — just enough to keep AudioContext alive
 
     this.keepaliveOsc.connect(this.keepaliveGain);
     this.keepaliveGain.connect(ctx.destination);
@@ -130,7 +130,7 @@ export class AudioQueue {
     // Ramp back up to keepalive volume
     this.keepaliveGain.gain.cancelScheduledValues(now);
     this.keepaliveGain.gain.setValueAtTime(this.keepaliveGain.gain.value, now);
-    this.keepaliveGain.gain.linearRampToValueAtTime(0.02, now + 0.1);
+    this.keepaliveGain.gain.linearRampToValueAtTime(0.005, now + 0.1);
   }
 
   /**
