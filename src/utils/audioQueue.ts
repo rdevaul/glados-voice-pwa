@@ -274,8 +274,6 @@ export class AudioQueue {
     // Pause keepalive during TTS playback
     this.stopKeepalive();
 
-    this.onPlaybackStart?.(url);
-
     const ctx = this.ctx;
     if (!ctx) {
       console.error('[AudioQueue] AudioContext not available');
@@ -291,14 +289,23 @@ export class AudioQueue {
       // Fetch the audio file as an ArrayBuffer
       console.log('[AudioQueue] fetching:', url);
       const response = await fetch(url);
+      console.log('[AudioQueue] fetch response — status:', response.status, 'ok:', response.ok, 'type:', response.headers.get('content-type'));
+
       if (!response.ok) {
         throw new Error(`HTTP ${response.status}: ${response.statusText}`);
       }
+
       const arrayBuffer = await response.arrayBuffer();
+      console.log('[AudioQueue] received ArrayBuffer — size:', arrayBuffer.byteLength, 'bytes');
+
+      if (arrayBuffer.byteLength === 0) {
+        throw new Error('Empty audio file received');
+      }
 
       // Decode the audio data
       console.log('[AudioQueue] decoding audio...');
       const audioBuffer = await ctx.decodeAudioData(arrayBuffer);
+      console.log('[AudioQueue] decoded — duration:', audioBuffer.duration, 's, channels:', audioBuffer.numberOfChannels, ', sampleRate:', audioBuffer.sampleRate);
 
       // Create an AudioBufferSourceNode
       const source = ctx.createBufferSource();
@@ -327,24 +334,86 @@ export class AudioQueue {
       // Start playback
       source.start(0);
       this._isPlaying = true;
-      console.log('[AudioQueue] playing:', url, 'duration:', audioBuffer.duration);
+      console.log('[AudioQueue] AudioBufferSourceNode started at ctx.currentTime:', ctx.currentTime);
+
+      // Fire onPlaybackStart AFTER source.start(0) — audio is actually playing now
+      this.onPlaybackStart?.(url);
 
     } catch (err) {
-      console.error('[AudioQueue] playback error:', err);
-      this._isPlaying = false;
-      this.currentSource = null;
-
-      const error = err instanceof Error ? err : new Error(String(err));
-      if (this.onError) {
-        this.onError(error, url);
+      console.error('[AudioQueue] AudioBufferSourceNode playback failed for URL:', url);
+      console.error('[AudioQueue] error details:', err);
+      console.error('[AudioQueue] error type:', err instanceof Error ? err.constructor.name : typeof err);
+      if (err instanceof DOMException) {
+        console.error('[AudioQueue] DOMException — name:', err.name, 'message:', err.message, 'code:', err.code);
       }
 
-      // Restore keepalive on error
-      this.resumeKeepalive();
+      // Try HTMLAudioElement fallback (works better on desktop browsers)
+      console.log('[AudioQueue] attempting HTMLAudioElement fallback...');
+      try {
+        await this.playWithHTMLAudio(url);
+      } catch (fallbackErr) {
+        console.error('[AudioQueue] HTMLAudioElement fallback also failed:', fallbackErr);
 
-      // Continue to next item in queue
-      this.playNext();
+        this._isPlaying = false;
+        this.currentSource = null;
+
+        const error = err instanceof Error ? err : new Error(String(err));
+        if (this.onError) {
+          this.onError(error, url);
+        }
+
+        // Restore keepalive on error
+        this.resumeKeepalive();
+
+        // Continue to next item in queue
+        this.playNext();
+      }
     }
+  }
+
+  /**
+   * Fallback playback using HTMLAudioElement.
+   * Used when AudioBufferSourceNode fails (e.g., decode errors on desktop).
+   */
+  private async playWithHTMLAudio(url: string): Promise<void> {
+    return new Promise((resolve, reject) => {
+      console.log('[AudioQueue] creating HTMLAudioElement for:', url);
+      const audio = new Audio(url);
+
+      audio.onloadedmetadata = () => {
+        console.log('[AudioQueue] HTMLAudioElement loaded — duration:', audio.duration);
+        this.currentDuration = audio.duration;
+      };
+
+      audio.onplay = () => {
+        this._isPlaying = true;
+        console.log('[AudioQueue] HTMLAudioElement started playing');
+        // Fire onPlaybackStart when audio actually starts
+        this.onPlaybackStart?.(url);
+      };
+
+      audio.onended = () => {
+        console.log('[AudioQueue] HTMLAudioElement ended');
+        if (this.currentUrl && this.onPlaybackEnd) {
+          this.onPlaybackEnd(this.currentUrl);
+        }
+        this.currentUrl = null;
+        this._isPlaying = false;
+
+        // Resume keepalive before playing next
+        this.resumeKeepalive();
+        this.playNext();
+        resolve();
+      };
+
+      audio.onerror = (e) => {
+        console.error('[AudioQueue] HTMLAudioElement error:', e, 'error code:', audio.error?.code, 'message:', audio.error?.message);
+        reject(new Error(`HTMLAudioElement error: ${audio.error?.message || 'Unknown error'}`));
+      };
+
+      // Start playback
+      audio.play().catch(reject);
+    });
   }
 }
 

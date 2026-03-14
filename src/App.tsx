@@ -204,6 +204,23 @@ function App() {
     };
     return () => { q.onPlaybackStart = prev; };
   }, [thinkingTone.stop]);
+
+  // Handle audio playback errors — restart thinking tone if response is not complete
+  useEffect(() => {
+    const q = audioQueue.current;
+    const prev = q.onError;
+    q.onError = (error: Error, url: string) => {
+      console.error('[App] audioQueue error:', error, 'url:', url);
+      // If response is not complete and TTS playback failed, restart thinking tone
+      if (stream.status === 'processing' || !stream.responseComplete) {
+        console.log('[App] restarting thinking tone after audio error (response incomplete)');
+        thinkingTone.start();
+      }
+      prev?.(error, url);
+    };
+    return () => { q.onError = prev; };
+  }, [thinkingTone.start, stream.status, stream.responseComplete]);
+
   const audioQueue = useRef(getAudioQueue());
 
   // Determine which mode we're using
