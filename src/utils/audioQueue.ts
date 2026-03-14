@@ -201,25 +201,39 @@ export class AudioQueue {
       // oscillators against currentTime=0 and expect them to fire correctly after resume.
       // Strategy: play immediately if already running, otherwise wait for resume()
       // with a 250ms timeout fallback (the nudge above should resolve it in <50ms).
-      if (ctx.state === 'running') {
-        this.playBeep();
-        this.startKeepalive();
-      } else {
-        console.log('[AudioQueue] ctx suspended — resuming before beep');
-        // Must resume() first, THEN schedule audio nodes against the
-        // now-advancing currentTime. Scheduling against currentTime=0
-        // of a suspended context means the beep is "already over" by
-        // the time the context starts running.
+      // iOS/Safari unlock strategy: create all audio nodes synchronously
+      // within the user gesture, then resume(). Nodes created during the
+      // gesture are allowed to play once the context resumes — but nodes
+      // created in an async callback after the gesture may be blocked.
+      //
+      // So we pre-create the beep oscillator NOW, start it, and it will
+      // begin producing sound as soon as ctx.resume() completes.
+
+      const now = ctx.currentTime;
+      const beepOsc = ctx.createOscillator();
+      const beepGain = ctx.createGain();
+      beepOsc.type = 'sine';
+      beepOsc.frequency.setValueAtTime(880, now);
+      beepGain.gain.setValueAtTime(0, now);
+      // Schedule the beep envelope — will fire once context starts running
+      beepGain.gain.linearRampToValueAtTime(0.55, now + 0.008);
+      beepGain.gain.linearRampToValueAtTime(0, now + 0.25);
+      beepOsc.connect(beepGain);
+      beepGain.connect(ctx.destination);
+      beepOsc.start(now);
+      beepOsc.stop(now + 0.26);
+
+      console.log('[AudioQueue] beep pre-scheduled at t=', now, 'ctx.state:', ctx.state);
+
+      if (ctx.state !== 'running') {
         ctx.resume().then(() => {
           console.log('[AudioQueue] resumed — ctx.currentTime:', ctx.currentTime);
-          this.playBeep();
           this.startKeepalive();
         }).catch(err => {
-          console.log('[AudioQueue] resume failed, trying beep anyway:', String(err));
-          // Fallback: try anyway — some browsers resolve resume weirdly
-          this.playBeep();
-          this.startKeepalive();
+          console.log('[AudioQueue] resume failed:', String(err));
         });
+      } else {
+        this.startKeepalive();
       }
 
       // Play anything that was queued
