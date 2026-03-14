@@ -1,18 +1,17 @@
 /**
  * AudioQueue — Sequential audio playback via Web Audio API.
  *
- * Chrome's autoplay policy blocks HTMLAudioElement.play() if called more
- * than ~1 second after a user gesture — which is always the case for async
- * TTS responses. Fix: route playback through an AudioContext that is
- * explicitly unlocked during the button-press gesture. An unlocked
- * AudioContext can play audio at any future time without restriction.
+ * iOS Safari blocks HTMLAudioElement.play() outside a user gesture, even when
+ * the AudioContext is unlocked. Fix: use AudioBufferSourceNode instead of
+ * HTMLAudioElement. Since the AudioContext is unlocked during the gesture,
+ * AudioBufferSourceNodes can play at any time without restriction.
  *
  * Architecture:
  *   warmUp()  — called on button press (gesture): creates AudioContext,
- *               plays a silent buffer to unlock it, and connects the
- *               HTMLAudioElement to the context graph via createMediaElementSource.
- *   enqueue() — called when TTS URL arrives: fetches audio, plays via
- *               AudioContext source node (not HTMLAudioElement.play() directly).
+ *               plays a beep to unlock it, and starts the keepalive tone.
+ *   enqueue() — called when TTS URL arrives: fetches audio as ArrayBuffer,
+ *               decodes it with ctx.decodeAudioData(), and plays via
+ *               AudioBufferSourceNode.
  */
 
 export type AudioQueueCallback = (url: string) => void;
@@ -21,14 +20,14 @@ export type AudioQueueEmptyCallback = () => void;
 
 export class AudioQueue {
   private queue: string[] = [];
-  private audio: HTMLAudioElement;
   private _isPlaying: boolean = false;
-  private _isPaused: boolean = false;
   private currentUrl: string | null = null;
+  private currentSource: AudioBufferSourceNode | null = null;
+  private currentStartTime: number = 0;
+  private currentDuration: number = 0;
 
   // Web Audio API — unlocked during warmUp gesture
   private ctx: AudioContext | null = null;
-  private mediaSource: MediaElementAudioSourceNode | null = null;
   private unlocked: boolean = false;
 
   // Keepalive tone — prevents AudioContext suspension
@@ -42,31 +41,7 @@ export class AudioQueue {
   public onError?: AudioQueueErrorCallback;
 
   constructor() {
-    this.audio = new Audio();
-    this.audio.preload = 'auto';
-
-    this.audio.onended = () => {
-      if (this.currentUrl && this.onPlaybackEnd) {
-        this.onPlaybackEnd(this.currentUrl);
-      }
-      this.currentUrl = null;
-      this._isPlaying = false;
-
-      // Resume keepalive before playing next (if queue empty, onQueueEmpty will handle it)
-      this.resumeKeepalive();
-      this.playNext();
-    };
-
-    this.audio.onerror = () => {
-      const error = new Error(`Failed to load audio: ${this.currentUrl}`);
-      if (this.currentUrl && this.onError) {
-        this.onError(error, this.currentUrl);
-      }
-      console.error('AudioQueue error:', this.currentUrl, this.audio.error);
-      this.currentUrl = null;
-      this._isPlaying = false;
-      this.playNext();
-    };
+    // No HTMLAudioElement needed — using AudioBufferSourceNode instead
   }
 
   /**
@@ -167,7 +142,7 @@ export class AudioQueue {
     if (this.unlocked) {
       // Already unlocked — play the start beep immediately for this press
       this.playBeep();
-      if (this.queue.length > 0 && !this._isPlaying && !this._isPaused) {
+      if (this.queue.length > 0 && !this._isPlaying) {
         this.playNext();
       }
       return;
@@ -184,13 +159,6 @@ export class AudioQueue {
       const ctx = this.ctx;
 
       console.log('[AudioQueue] warmUp — ctx.state:', ctx.state);
-
-      // Connect the HTMLAudioElement to the AudioContext graph synchronously.
-      // createMediaElementSource can only be called once per element.
-      if (!this.mediaSource) {
-        this.mediaSource = ctx.createMediaElementSource(this.audio);
-        this.mediaSource.connect(ctx.destination);
-      }
 
       // Mark unlocked immediately — don't block on resume() promise.
       this.unlocked = true;
@@ -256,46 +224,26 @@ export class AudioQueue {
 
   public enqueue(url: string): void {
     this.queue.push(url);
-    if (!this._isPlaying && !this._isPaused) {
+    if (!this._isPlaying) {
       this.playNext();
     }
   }
 
   public clear(): void {
     this.queue = [];
-    this.audio.pause();
-    this.audio.src = '';
+    if (this.currentSource) {
+      this.currentSource.stop();
+      this.currentSource = null;
+    }
     this.currentUrl = null;
     this._isPlaying = false;
-    this._isPaused = false;
-  }
-
-  public pause(): void {
-    if (this._isPlaying) {
-      this.audio.pause();
-      this._isPaused = true;
-      this._isPlaying = false;
-    }
-  }
-
-  public resume(): void {
-    if (this._isPaused && this.currentUrl) {
-      this._isPaused = false;
-      this._isPlaying = true;
-      this.audio.play().catch(err => {
-        console.error('[AudioQueue] resume failed:', err);
-        this._isPlaying = false;
-      });
-    } else if (!this._isPlaying && this.queue.length > 0) {
-      this.playNext();
-    }
   }
 
   public skip(): void {
-    if (this._isPlaying || this._isPaused) {
-      this.audio.pause();
+    if (this._isPlaying && this.currentSource) {
+      this.currentSource.stop();
+      this.currentSource = null;
       this._isPlaying = false;
-      this._isPaused = false;
       this.playNext();
     }
   }
@@ -304,12 +252,14 @@ export class AudioQueue {
   public getContext(): AudioContext | null { return this.unlocked ? this.ctx : null; }
 
   public get isPlaying(): boolean { return this._isPlaying; }
-  public get isPaused(): boolean { return this._isPaused; }
   public get queueLength(): number { return this.queue.length; }
-  public get currentTime(): number { return this.audio.currentTime; }
-  public get duration(): number { return this.audio.duration || 0; }
+  public get currentTime(): number {
+    if (!this._isPlaying || !this.ctx) return 0;
+    return this.ctx.currentTime - this.currentStartTime;
+  }
+  public get duration(): number { return this.currentDuration; }
 
-  private playNext(): void {
+  private async playNext(): Promise<void> {
     if (this.queue.length === 0) {
       this._isPlaying = false;
       // Restore keepalive when queue empties
@@ -320,38 +270,80 @@ export class AudioQueue {
 
     const url = this.queue.shift()!;
     this.currentUrl = url;
-    this.audio.src = url;
 
     // Pause keepalive during TTS playback
     this.stopKeepalive();
 
     this.onPlaybackStart?.(url);
 
-    // If AudioContext is unlocked, the media element source will play through it.
-    // If not yet unlocked, fall back to direct HTMLAudioElement.play().
-    const playPromise = this.audio.play();
-    if (playPromise) {
-      playPromise
-        .then(() => {
-          this._isPlaying = true;
-          console.log('[AudioQueue] playing:', url);
-        })
-        .catch(err => {
-          console.warn('[AudioQueue] play blocked:', err.name, err.message);
-          this._isPlaying = false;
+    const ctx = this.ctx;
+    if (!ctx) {
+      console.error('[AudioQueue] AudioContext not available');
+      const error = new Error('AudioContext not available');
+      if (this.onError) {
+        this.onError(error, url);
+      }
+      this.resumeKeepalive();
+      return;
+    }
 
-          if (err.name === 'NotAllowedError') {
-            // Autoplay blocked — re-queue, will retry on next warmUp
-            this.queue.unshift(url);
-            this.unlocked = false;
-            // Restore keepalive if playback failed
-            this.resumeKeepalive();
-          } else if (this.onError) {
-            this.onError(err, url);
-            // Restore keepalive on error
-            this.resumeKeepalive();
-          }
-        });
+    try {
+      // Fetch the audio file as an ArrayBuffer
+      console.log('[AudioQueue] fetching:', url);
+      const response = await fetch(url);
+      if (!response.ok) {
+        throw new Error(`HTTP ${response.status}: ${response.statusText}`);
+      }
+      const arrayBuffer = await response.arrayBuffer();
+
+      // Decode the audio data
+      console.log('[AudioQueue] decoding audio...');
+      const audioBuffer = await ctx.decodeAudioData(arrayBuffer);
+
+      // Create an AudioBufferSourceNode
+      const source = ctx.createBufferSource();
+      source.buffer = audioBuffer;
+      source.connect(ctx.destination);
+
+      // Track playback timing
+      this.currentSource = source;
+      this.currentStartTime = ctx.currentTime;
+      this.currentDuration = audioBuffer.duration;
+
+      // Handle playback end
+      source.onended = () => {
+        if (this.currentUrl && this.onPlaybackEnd) {
+          this.onPlaybackEnd(this.currentUrl);
+        }
+        this.currentUrl = null;
+        this.currentSource = null;
+        this._isPlaying = false;
+
+        // Resume keepalive before playing next
+        this.resumeKeepalive();
+        this.playNext();
+      };
+
+      // Start playback
+      source.start(0);
+      this._isPlaying = true;
+      console.log('[AudioQueue] playing:', url, 'duration:', audioBuffer.duration);
+
+    } catch (err) {
+      console.error('[AudioQueue] playback error:', err);
+      this._isPlaying = false;
+      this.currentSource = null;
+
+      const error = err instanceof Error ? err : new Error(String(err));
+      if (this.onError) {
+        this.onError(error, url);
+      }
+
+      // Restore keepalive on error
+      this.resumeKeepalive();
+
+      // Continue to next item in queue
+      this.playNext();
     }
   }
 }
