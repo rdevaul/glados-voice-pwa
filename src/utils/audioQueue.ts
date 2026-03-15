@@ -30,6 +30,11 @@ export class AudioQueue {
   private ctx: AudioContext | null = null;
   private unlocked: boolean = false;
 
+  // Master gain for TTS playback volume (AudioBufferSourceNode output is often
+  // quieter than HTMLAudioElement because there's no browser-level normalization)
+  private masterGain: GainNode | null = null;
+  private static readonly TTS_VOLUME = 2.0; // Boost factor for TTS audio
+
   // Keepalive tone — prevents AudioContext suspension
   private keepaliveOsc: OscillatorNode | null = null;
   private keepaliveGain: GainNode | null = null;
@@ -160,48 +165,36 @@ export class AudioQueue {
 
       console.log('[AudioQueue] warmUp — ctx.state:', ctx.state);
 
+      // Create master gain node for TTS volume boost
+      if (!this.masterGain) {
+        this.masterGain = ctx.createGain();
+        this.masterGain.gain.value = AudioQueue.TTS_VOLUME;
+        this.masterGain.connect(ctx.destination);
+      }
+
       // Mark unlocked immediately — don't block on resume() promise.
       this.unlocked = true;
       console.log('[AudioQueue] unlocked (synchronous)');
 
-      // Play the beep once the context is actually running.
-      // On iOS the context starts suspended even inside a gesture; we can't schedule
-      // oscillators against currentTime=0 and expect them to fire correctly after resume.
-      // Strategy: play immediately if already running, otherwise wait for resume()
-      // with a 250ms timeout fallback (the nudge above should resolve it in <50ms).
-      // iOS/Safari unlock strategy: create all audio nodes synchronously
-      // within the user gesture, then resume(). Nodes created during the
-      // gesture are allowed to play once the context resumes — but nodes
-      // created in an async callback after the gesture may be blocked.
-      //
-      // So we pre-create the beep oscillator NOW, start it, and it will
-      // begin producing sound as soon as ctx.resume() completes.
+      // Beep strategy: if context is already running, play immediately.
+      // If suspended, resume first THEN play the beep — scheduling oscillators
+      // at currentTime=0 on a suspended context means the envelope is already
+      // finished by the time the context actually starts processing audio.
+      const playBeepAndKeepalive = () => {
+        console.log('[AudioQueue] context running — playing beep at ctx.currentTime:', ctx.currentTime);
+        this.playBeep();
+        this.startKeepalive();
+      };
 
-      const now = ctx.currentTime;
-      const beepOsc = ctx.createOscillator();
-      const beepGain = ctx.createGain();
-      beepOsc.type = 'sine';
-      beepOsc.frequency.setValueAtTime(880, now);
-      beepGain.gain.setValueAtTime(0, now);
-      // Schedule the beep envelope — will fire once context starts running
-      beepGain.gain.linearRampToValueAtTime(0.55, now + 0.008);
-      beepGain.gain.linearRampToValueAtTime(0, now + 0.25);
-      beepOsc.connect(beepGain);
-      beepGain.connect(ctx.destination);
-      beepOsc.start(now);
-      beepOsc.stop(now + 0.26);
-
-      console.log('[AudioQueue] beep pre-scheduled at t=', now, 'ctx.state:', ctx.state);
-
-      if (ctx.state !== 'running') {
+      if (ctx.state === 'running') {
+        playBeepAndKeepalive();
+      } else {
         ctx.resume().then(() => {
           console.log('[AudioQueue] resumed — ctx.currentTime:', ctx.currentTime);
-          this.startKeepalive();
+          playBeepAndKeepalive();
         }).catch(err => {
           console.log('[AudioQueue] resume failed:', String(err));
         });
-      } else {
-        this.startKeepalive();
       }
 
       // Play anything that was queued
@@ -307,10 +300,12 @@ export class AudioQueue {
       const audioBuffer = await ctx.decodeAudioData(arrayBuffer);
       console.log('[AudioQueue] decoded — duration:', audioBuffer.duration, 's, channels:', audioBuffer.numberOfChannels, ', sampleRate:', audioBuffer.sampleRate);
 
-      // Create an AudioBufferSourceNode
+      // Create an AudioBufferSourceNode, routed through master gain for volume boost
       const source = ctx.createBufferSource();
       source.buffer = audioBuffer;
-      source.connect(ctx.destination);
+      const outputNode = this.masterGain || ctx.destination;
+      source.connect(outputNode);
+      console.log('[AudioQueue] source connected to', this.masterGain ? 'masterGain (boost)' : 'destination (direct)');
 
       // Track playback timing
       this.currentSource = source;
