@@ -139,6 +139,10 @@ function App() {
   const [textInput, setTextInput] = useState('');
   const [isProcessing, setIsProcessing] = useState(false);
 
+  // App state for splash screen flow
+  const [appState, setAppState] = useState<'splash' | 'connecting' | 'ready'>('splash');
+  const [connectingStatus, setConnectingStatus] = useState('');
+
   // Debug log overlay — tap status icon 5× to toggle
   const [debugLogs, setDebugLogs] = useState<string[]>([]);
   const [showDebug, setShowDebug] = useState(false);
@@ -231,23 +235,18 @@ function App() {
   // Async model: we no longer block on processing state
   // const isStreamProcessing = stream.status === 'processing';
 
-  // Track if we've initiated connection to avoid loops
-  const connectionInitiated = useRef(false);
-  
-  // Connect to WebSocket on mount if streaming enabled
-  useEffect(() => {
-    if (useStreaming && !connectionInitiated.current) {
-      connectionInitiated.current = true;
-      console.log('Initiating WebSocket connection...');
-      stream.connect();
-    }
-    // No cleanup - let the hook handle its own WebSocket lifecycle
-  }, [useStreaming, stream.connect]);
-
   // Save messages whenever they change
   useEffect(() => {
     saveMessages(messages);
   }, [messages]);
+
+  // Transition from connecting to ready when WebSocket connects
+  useEffect(() => {
+    if (appState === 'connecting' && (stream.status === 'ready' || stream.status === 'processing' || stream.status === 'recording')) {
+      setAppState('ready');
+      setConnectingStatus('');
+    }
+  }, [appState, stream.status]);
 
   // Check mic permission on mount
   useEffect(() => {
@@ -480,16 +479,44 @@ function App() {
 
     // Warm up audio queue on first interaction
     audioQueue.current.warmUp();
-    
+
     if (audioRef.current) {
       audioRef.current.pause();
       audioRef.current.src = url;
     } else {
       audioRef.current = new Audio(url);
     }
-    
+
     audioRef.current.play().catch(err => console.log('Autoplay blocked:', err));
   }, []);
+
+  // Handle Connect button click on splash screen
+  const handleConnect = async () => {
+    setAppState('connecting');
+
+    // Step 1: Warm up audio (must be synchronous in gesture)
+    setConnectingStatus('Unlocking audio...');
+    audioQueue.current.warmUp();
+
+    // Step 2: Request mic permission with brief recording
+    setConnectingStatus('Requesting microphone access...');
+    try {
+      const micStream = await navigator.mediaDevices.getUserMedia({ audio: true });
+      // Brief pause then stop — just to trigger permission
+      await new Promise(resolve => setTimeout(resolve, 300));
+      micStream.getTracks().forEach(t => t.stop());
+      setMicPermission('granted');
+    } catch {
+      setMicPermission('denied');
+      // Continue anyway — text-only mode
+    }
+
+    // Step 3: Connect WebSocket
+    setConnectingStatus('Connecting to voice server...');
+    stream.connect();
+
+    // Transition to ready happens in the useEffect that watches stream.status
+  };
 
   // Streaming mode handlers
   const handleStreamingStart = async () => {
@@ -680,6 +707,27 @@ function App() {
       default: return '⚪';
     }
   };
+
+  // Show splash screen when not ready
+  if (appState === 'splash' || appState === 'connecting') {
+    return (
+      <div className="app">
+        <div className="splash-screen">
+          <h1>🎂 GLaDOS</h1>
+          <button
+            className="connect-button"
+            onClick={handleConnect}
+            disabled={appState === 'connecting'}
+          >
+            {appState === 'connecting' ? 'Connecting...' : 'Connect'}
+          </button>
+          {appState === 'connecting' && connectingStatus && (
+            <p className="connecting-status">{connectingStatus}</p>
+          )}
+        </div>
+      </div>
+    );
+  }
 
   return (
     <div className="app">
