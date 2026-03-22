@@ -122,6 +122,25 @@ export function useThinkingTone(options: ThinkingToneOptions = {}) {
     gain.gain.linearRampToValueAtTime(0, now + fadeOut);
   }, [fadeOut]);
 
+  /**
+   * Instantly silence the thinking tone — no fade ramp.
+   * Use this when TTS audio starts playing to avoid overlap.
+   * (stop() has a 0.5s fade which causes audible bleed-through into TTS.)
+   */
+  const kill = useCallback(() => {
+    if (!readyRef.current) return;
+    activeRef.current = false;
+
+    const ctx = getAudioQueue().getContext();
+    const gain = gainRef.current;
+    if (!ctx || !gain) return;
+
+    const now = ctx.currentTime;
+    gain.gain.cancelScheduledValues(now);
+    gain.gain.setValueAtTime(0, now);
+    console.log('[ThinkingTone] kill() — instant silence');
+  }, []);
+
   useEffect(() => {
     return () => {
       // Don't close the shared AudioContext — AudioQueue owns it
@@ -131,5 +150,5 @@ export function useThinkingTone(options: ThinkingToneOptions = {}) {
     };
   }, []);
 
-  return { start, stop };
+  return { start, stop, kill };
 }

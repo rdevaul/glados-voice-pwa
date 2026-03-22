@@ -199,15 +199,17 @@ function App() {
   }, [stream.responseComplete, thinkingTone.stop]);
 
   // Stop thinking tone as soon as TTS audio starts playing — seamless handoff.
+  // Use kill() (instant) instead of stop() (0.5s fade) to prevent audible overlap
+  // where the thinking tone bleeds through into the TTS playback.
   useEffect(() => {
     const q = audioQueue.current;
     const prev = q.onPlaybackStart;
     q.onPlaybackStart = (url: string) => {
-      thinkingTone.stop();
+      thinkingTone.kill();
       prev?.(url);
     };
     return () => { q.onPlaybackStart = prev; };
-  }, [thinkingTone.stop]);
+  }, [thinkingTone.kill]);
 
   // Handle audio playback errors — restart thinking tone if response is not complete
   useEffect(() => {
