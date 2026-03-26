@@ -104,6 +104,31 @@ def _is_transient_error(stderr_text: str, returncode: int) -> bool:
     return any(pattern in stderr_lower for pattern in transient_patterns)
 
 
+def _extract_json_from_output(raw: str) -> str:
+    """Strip plugin log lines and extract the JSON object from OpenClaw --json output.
+    
+    OpenClaw may prefix stdout with [plugins] lines before the JSON payload.
+    Find the first '{' that starts a JSON object and return from there.
+    """
+    # Fast path: starts directly with '{'
+    stripped = raw.strip()
+    if stripped.startswith('{'):
+        return stripped
+    
+    # Strip leading [plugins] / [INFO] / other log lines
+    lines = stripped.splitlines()
+    for i, line in enumerate(lines):
+        if line.strip().startswith('{'):
+            return '\n'.join(lines[i:])
+    
+    # Last resort: find first '{' anywhere
+    idx = stripped.find('{')
+    if idx != -1:
+        return stripped[idx:]
+    
+    return stripped  # Return as-is, will fail json.loads with a clear error
+
+
 def _filter_stderr(stderr_text: str) -> str:
     """
     Filter out harmless warnings from stderr, returning only real errors.
@@ -240,7 +265,9 @@ async def stream_chat_response(
         
         if returncode == 0:
             try:
-                response_data = json.loads(stdout.decode())
+                raw_output = stdout.decode()
+                json_str = _extract_json_from_output(raw_output)
+                response_data = json.loads(json_str)
                 payloads = response_data.get("result", {}).get("payloads", [])
                 
                 if payloads and payloads[0].get("text"):
@@ -261,12 +288,7 @@ async def stream_chat_response(
                     
             except json.JSONDecodeError as e:
                 logger.error(f"JSON decode error: {e}")
-                # Try to use raw output
-                raw = stdout.decode().strip()
-                if raw:
-                    yield raw
-                else:
-                    yield "I received your message."
+                yield "I received your message but had trouble parsing the response."
         else:
             error_msg = _filter_stderr(stderr.decode()) if stderr else "Unknown error"
             error_msg = error_msg[:200] if error_msg else "Unknown error"
@@ -342,7 +364,9 @@ async def get_all_responses(user_text: str, session_id: str | None = None) -> li
         
         if returncode == 0:
             try:
-                response_data = json.loads(stdout.decode())
+                raw_output = stdout.decode()
+                json_str = _extract_json_from_output(raw_output)
+                response_data = json.loads(json_str)
                 payloads = response_data.get("result", {}).get("payloads", [])
                 
                 if payloads:
@@ -365,10 +389,7 @@ async def get_all_responses(user_text: str, session_id: str | None = None) -> li
                     
             except json.JSONDecodeError as e:
                 logger.error(f"JSON decode error: {e}")
-                raw = stdout.decode().strip()
-                if raw:
-                    return [{"text": raw, "mediaUrl": None}]
-                return [{"text": "I received your message.", "mediaUrl": None}]
+                return [{"text": "I received your message but had trouble parsing the response.", "mediaUrl": None}]
         else:
             error_msg = _filter_stderr(stderr.decode()) if stderr else "Unknown error"
             error_msg = error_msg[:200] if error_msg else "Unknown error"
@@ -475,7 +496,9 @@ async def get_all_responses_with_progress(
         
         if returncode == 0:
             try:
-                response_data = json.loads(stdout.decode())
+                raw_output = stdout.decode()
+                json_str = _extract_json_from_output(raw_output)
+                response_data = json.loads(json_str)
                 payloads = response_data.get("result", {}).get("payloads", [])
                 
                 if payloads:
@@ -498,10 +521,7 @@ async def get_all_responses_with_progress(
                     
             except json.JSONDecodeError as e:
                 logger.error(f"JSON decode error: {e}")
-                raw = stdout.decode().strip()
-                if raw:
-                    return [{"text": raw, "mediaUrl": None}]
-                return [{"text": "I received your message.", "mediaUrl": None}]
+                return [{"text": "I received your message but had trouble parsing the response.", "mediaUrl": None}]
         else:
             error_msg = _filter_stderr(stderr.decode()) if stderr else "Unknown error"
             error_msg = error_msg[:200] if error_msg else "Unknown error"
