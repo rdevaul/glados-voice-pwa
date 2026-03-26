@@ -383,7 +383,16 @@ async def get_all_responses(user_text: str, session_id: str | None = None) -> li
                     
                     if results:
                         return results
-                    
+
+                # Check if this is a sub-agent/cron completion event — drop silently
+                if "runId" in response_data and "status" in response_data:
+                    logger.info(
+                        f"Sub-agent completion event received "
+                        f"(runId={response_data.get('runId')}, status={response_data.get('status')}), "
+                        f"skipping TTS"
+                    )
+                    return []  # Empty list — caller must handle gracefully
+
                 logger.warning(f"No text payloads in response: {list(response_data.keys())}")
                 return [{"text": "I processed your message but got an unexpected response format.", "mediaUrl": None}]
                     
@@ -515,7 +524,17 @@ async def get_all_responses_with_progress(
                     
                     if results:
                         return results
-                    
+
+                # Check if this is a sub-agent/cron completion event (runId/status/summary/result).
+                # These are internal bookkeeping events, not user-facing responses — drop silently.
+                if "runId" in response_data and "status" in response_data:
+                    logger.info(
+                        f"Sub-agent completion event received "
+                        f"(runId={response_data.get('runId')}, status={response_data.get('status')}), "
+                        f"skipping TTS"
+                    )
+                    return []  # Empty list — caller must handle gracefully (no TTS, no error)
+
                 logger.warning(f"No text payloads in response: {list(response_data.keys())}")
                 return [{"text": "I processed your message but got an unexpected response format.", "mediaUrl": None}]
                     

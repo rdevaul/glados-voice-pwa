@@ -572,7 +572,18 @@ class WebSocketManager:
             )
             
             logger.info(f"Received {len(payloads)} payload(s) from OpenClaw")
-            
+
+            # Empty list = sub-agent/cron completion event — nothing to say, just reset state
+            if not payloads:
+                logger.info("No payloads to deliver (likely sub-agent event) — resetting to idle")
+                await session_store.update_session(
+                    session_id,
+                    state='idle',
+                    partial_response='',
+                    partial_transcript=''
+                )
+                return
+
             # CC first response to Telegram for mobile notifications
             if payloads:
                 first_text = payloads[0].get("text", "")
@@ -656,7 +667,16 @@ class WebSocketManager:
         
         # Strip markdown for cleaner speech
         clean_text = strip_markdown(text)
-        
+
+        # OpenAI TTS hard limit is 4096 chars — truncate with a warning rather than
+        # sending a massive blob that causes a 400 and silences the response entirely.
+        OPENAI_TTS_MAX_CHARS = 4000  # Leave a small buffer below the 4096 limit
+        if len(clean_text) > OPENAI_TTS_MAX_CHARS:
+            logger.warning(
+                f"TTS input too long ({len(clean_text)} chars), truncating to {OPENAI_TTS_MAX_CHARS}"
+            )
+            clean_text = clean_text[:OPENAI_TTS_MAX_CHARS].rsplit(' ', 1)[0] + "…"
+
         # Try OpenAI TTS first
         openai_client = get_openai_client()
         if openai_client:
